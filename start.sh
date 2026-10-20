@@ -209,7 +209,7 @@ ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "TF_RDM
 [[ -z "$ROUND_ROWS" ]] || ENGINE_ENV+=("TF_DS_ROUND_ROWS=$ROUND_ROWS")
 (( PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS")
 (( DISPLAY_KV_MIB == 0 )) || ENGINE_ENV+=("TF_DS_DISPLAY_KV_MIB=$DISPLAY_KV_MIB" "TF_DS_DISPLAY_KV_CARD=$DISPLAY_KV_CARD")
-while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP)=' || true)
+while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|DISPLAY_KV_MIB|DISPLAY_KV_CARD|ROUND_ROWS|GRAPHS|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP)=' || true)
 envs() { local x; for x in "$@"; do printf -- '-e %q ' "$x"; done; }
 RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --gpus all --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK --device /dev/infiniband"
 (( DISPLAY_KV_MIB == 0 )) || RUN_ARGS+=" --device $DISPLAY_KV_CARD:$DISPLAY_KV_CARD:rw"   # zig/patches/0007: the DRM card both ranks map the KV on

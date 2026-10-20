@@ -17,16 +17,21 @@ class PoolSettingsTest(unittest.TestCase):
                 env = dict(PATH=os.environ["PATH"], CONTEXT="65536", POOL=pool, REPLAY_FLOOR="0", PARALLEL="4",
                            HF_HUB_OFFLINE="1", ROUND_ROWS="", PREFILL_INTERLEAVE_MS="0", RDMA_IDLE_S="2",
                            RDMA_NAP_US="500", DRAFTS="1", GRAPHS="1", SIDE="0", PREFETCH="0", ENGRAM_AIO="0",
-                           TF_DS_POOL="999999", TF_DS_WINDOW="1")
+                           DISPLAY_KV_MIB="0", DISPLAY_KV_CARD="/dev/dri/card0",
+                           TF_DS_POOL="999999", TF_DS_WINDOW="1",
+                           TF_DS_DISPLAY_KV_MIB="999", TF_DS_DISPLAY_KV_CARD="/dev/dri/card9")
                 result = subprocess.run(["bash", "-euc", engine + follow + '\nprintf "%s\\n" "${ENGINE_ENV[@]}" "$FOLLOW"'],
                                         env=env, capture_output=True, text=True, check=True)
                 lines = result.stdout.splitlines()
                 self.assertNotIn("TF_DS_POOL=999999", lines)
                 self.assertNotIn("TF_DS_WINDOW=1", lines)
+                self.assertNotIn("TF_DS_DISPLAY_KV_MIB=999", lines)
+                self.assertNotIn("TF_DS_DISPLAY_KV_CARD=/dev/dri/card9", lines)
                 self.assertEqual([line for line in lines if line.startswith("TF_DS_POOL=")],
                                  ["TF_DS_POOL=" + pool] if pool else [])
                 self.assertEqual([line for line in lines if line.startswith("TF_DS_WINDOW=")],
                                  ["TF_DS_WINDOW=65536"] if pool else [])
+                self.assertEqual([line for line in lines if line.startswith("TF_DS_DISPLAY_KV_")], [])
                 self.assertTrue(lines[-1].startswith("--pool " + (pool or "65536") + " --streams 4"))
 
 
