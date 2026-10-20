@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `zig/patches/0007-display-kv.patch` and `DISPLAY_KV_MIB` / `DISPLAY_KV_CARD` (off by default; headless GB10 only): the KV caches on the framebuffer the UEFI reserves,
+  so their bytes leave the host's `MemAvailable` (the GLM-5.3-Flash recipe's display-KV idea). At the default `CONTEXT` the head's idle `MemAvailable` went from
+  6.76 to 7.49 GiB and its lowest during a cold 96K-token prompt from 5.89 to 7.12 GiB (worker: 8.63 to 9.22 and 8.60 to 9.19). `tools/exact.py`: 31 of 31 cases identical with it
+  on and off, the same image; `tools/validate.py` and `tools/prompt_reuse.py` pass with it on. The engine's host tests with the recipe's patches and this one: 21/21 steps, 232/232 tests.
+
 - Optional `systemd/dsv41-tensorfold.service` and `docs/systemd.md`: a manually configured user service for the existing
   foreground launcher, with `PREPARE=0`, a 60-second failure restart delay and at most three starts in 30 minutes.
   Nothing installs or enables it automatically. Unit validation and opt-in transient stub tests cover failure exits,
