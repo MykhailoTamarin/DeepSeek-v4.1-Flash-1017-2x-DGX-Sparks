@@ -17,6 +17,12 @@
   `mixed pack: 27 float linears`. An EXL3-only pack (EAQ v1) plans no plain entries and runs exactly as before, so the
   same image serves both. The patch is checked against `TF_REF`/`INPUTS_REF` by `scripts/test_mixed_pack_patch.py`.
 
+- BF16 sources widen to the f32 entries the loaders plan: `zig/patches-inputs/0002-widen-bf16.patch` in the rank-cache
+  writer, and `zig/patches/0011-widen-bf16.patch` in the engine's checkpoint reader. EAQ v1.1 (as v1) stores the eight
+  `attn.indexer.weights_proj.weight` tensors as BF16 while both plans ask for f32, so the first rank-cache write stopped
+  with `error: UnsupportedConversion`; the widen is exact (BF16's bits in the high half, zeros below), the loader's
+  `.to(torch.float32)`. `scripts/test_mixed_pack_patch.py` checks both patches.
+
 - `zig/patches/0007-display-kv.patch` and `DISPLAY_KV_MIB` / `DISPLAY_KV_CARD` (off by default; headless GB10 only): the KV caches on the framebuffer the UEFI reserves,
   so their bytes leave the host's `MemAvailable` (the GLM-5.3-Flash recipe's display-KV idea). At the default `CONTEXT` the head's idle `MemAvailable` went from
   6.76 to 7.49 GiB and its lowest during a cold 96K-token prompt from 5.89 to 7.12 GiB (worker: 8.63 to 9.22 and 8.60 to 9.19). `tools/exact.py`: 31 of 31 cases identical with it
