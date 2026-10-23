@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Default checkpoint moved to `Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw` @ `aee640e2` (39 shards,
+  ~196 GiB). v1.1 keeps the EAQ v1 widths but stores 27 indexer/compressor linears as BF16, so the engine must have the
+  mixed-pack loader. `ABLIT=1` still requires the EAQ v1 checkpoint and is refused with the v1.1 default.
+  `scripts/test_checkpoint_pin.py` checks the new pin.
+
 - `zig/patches/0007-display-kv.patch` and `DISPLAY_KV_MIB` / `DISPLAY_KV_CARD` (off by default; headless GB10 only): the KV caches on the framebuffer the UEFI reserves,
   so their bytes leave the host's `MemAvailable` (the GLM-5.3-Flash recipe's display-KV idea). At the default `CONTEXT` the head's idle `MemAvailable` went from
   6.76 to 7.49 GiB and its lowest during a cold 96K-token prompt from 5.89 to 7.12 GiB (worker: 8.63 to 9.22 and 8.60 to 9.19). `tools/exact.py`: 31 of 31 cases identical with it
