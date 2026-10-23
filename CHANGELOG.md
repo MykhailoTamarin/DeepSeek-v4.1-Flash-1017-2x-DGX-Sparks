@@ -23,10 +23,20 @@
   with `error: UnsupportedConversion`; the widen is exact (BF16's bits in the high half, zeros below), the loader's
   `.to(torch.float32)`. `scripts/test_mixed_pack_patch.py` checks both patches.
 
-- `zig/patches/0007-display-kv.patch` and `DISPLAY_KV_MIB` / `DISPLAY_KV_CARD` (off by default; headless GB10 only): the KV caches on the framebuffer the UEFI reserves,
-  so their bytes leave the host's `MemAvailable` (the GLM-5.3-Flash recipe's display-KV idea). At the default `CONTEXT` the head's idle `MemAvailable` went from
-  6.76 to 7.49 GiB and its lowest during a cold 96K-token prompt from 5.89 to 7.12 GiB (worker: 8.63 to 9.22 and 8.60 to 9.19). `tools/exact.py`: 31 of 31 cases identical with it
-  on and off, the same image; `tools/validate.py` and `tools/prompt_reuse.py` pass with it on. The engine's host tests with the recipe's patches and this one: 21/21 steps, 232/232 tests.
+- The KV caches can live on the headless GB10's display reservation: `zig/patches/0007-display-kv.patch` and
+  `DISPLAY_KV_MIB` / `DISPLAY_KV_CARD` (off by default). Their bytes leave the host's `MemAvailable` (the
+  GLM-5.3-Flash recipe's display-KV idea). Measured earlier on the same pair with the PR's mixed-pack patches: the
+  head's idle `MemAvailable` went from 6.76 to 7.49 GiB and its lowest during a cold 96K-token prompt from 5.89 to
+  7.12 GiB (worker: 8.63 to 9.22 and 8.60 to 9.19); `tools/exact.py` 31 of 31 identical with it on and off.
+
+- A mixed pack's plain (cuBLAS) linear runs over a fixed number of rows: `zig/patches/0012-plain-rows.patch` and
+  `TF_DS_PLAIN_ROWS` (default 16, never beyond a round's rows; `0` turns the padding off). cuBLAS picks its kernel and
+  split-K from the GEMM's shape and its rounding follows the pick, so a decode round whose row count changes with the
+  streams or the draft block could change a token's bits. On the pair, without it, drafts-on and drafts-off replies
+  matched 4 of 8 `tools/validate.py` prompts, and its 8-concurrent check matched 4 of 8 with drafts off (6 of 8 with
+  drafts on). With it, a re-run on the PR branch matched 8 of 8 prompts and 31 of 31 `tools/exact.py` cases bit for bit.
+  The EXL3 linears are untouched: their kernels compute each row in a fixed order, which is why EAQ v1 kept the same
+  bits across round shapes.
 
 - Optional `systemd/dsv41-tensorfold.service` and `docs/systemd.md`: a manually configured user service for the existing
   foreground launcher, with `PREPARE=0`, a 60-second failure restart delay and at most three starts in 30 minutes.
