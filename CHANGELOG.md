@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `zig/patches/0039-display-kv.patch` (local, not upstream; `DISPLAY_KV_MIB` / `DISPLAY_KV_CARD`, off by default; headless GB10 only): the KV caches on the framebuffer the UEFI reserves, so their bytes leave the host's `MemAvailable` (PR #9's `0007`, ported by Robert Wojciechowski onto `0008`'s pool and window and the port's KV sharding; `display.zig` by E-Zou Shen). Rebased onto `fbbc971` after upstream's `0034-rebase-followups` took that number, so it is `0039` and applies after `0038`. On the stock recipe (replicated KV, 893 MiB a rank, all of it on the framebuffer), the head's idle `MemAvailable` went from 6.76 to 7.49 GiB and its lowest during a cold 96K-token prompt from 5.89 to 7.12 GiB (worker: 8.63 to 9.22 and 8.60 to 9.19); `tools/exact.py` 31 of 31 identical with it on and off (39 of 39 on the ported patch with the sharded pool).
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
   `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).

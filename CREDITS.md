@@ -184,6 +184,11 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
 - **`zig/patches/0033-graph-cap.patch`** (the CUDA graph cache keeps at most `GRAPH_CAP` graphs, issue #69) was authored by
   **E-Zou Shen ([ezoushen](https://github.com/ezoushen))** in [pull request #70](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/70)
   (commit [`a1ceaf0`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/70/commits/a1ceaf0fd88892712f748e3080e187d2b6526396), sent as `0031`); carried as sent, renumbered.
+- **`zig/patches/0039-display-kv.patch`** (local, not upstream: display-reserve KV for the dsv41 family) ports the DRM-framebuffer backend of Mia's AI Lab's TensorFold GLM engine
+  (`glm_cuda/cuda_display_kv.zig`, itself from the TensorFold contributors) to this engine's KV caches: **`display.zig`**, the recipe's settings and the
+  DRM master drop right after the card open were written for this recipe by **E-Zou Shen ([ezoushen](https://github.com/ezoushen))** in
+  [pull request #9](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/9), and its wiring onto `0008`'s pool and window and the
+  port's KV sharding by **Robert Wojciechowski ([wojo](https://github.com/wojo))**; Apache-2.0.
 - **`zig/patches/0036-metrics-cached-prompt-tokens.patch`** (cached prompt tokens in `/metrics`, `/health` and `max_model_len` in `/v1/models`, issue #58): the
   cached-token counter, its vLLM-named repeats and the engine flag that turns them on were authored by
   **[manuel1618](https://github.com/manuel1618)** in [pull request #8](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/8) of the 4-Spark recipe

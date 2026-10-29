@@ -12,6 +12,7 @@ WORKER=user@192.0.2.2          # ssh target of the second Spark (key-based: ssh-
 # ABLIT=0                     # 1: matching Keys overlay on Mia EAQ 2.9 bpw; needs your HF token AND access below
 # HF_TOKEN=hf_...              # HF read token (or use hf auth login on the head); never commit your token
 # ABLIT=1 requires access: https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated
+# DISPLAY_KV_MIB=1792         # headless GB10 only: the KV caches on the framebuffer the UEFI reserves (zig/patches/0039; 0: off); DISPLAY_KV_CARD=/dev/dri/card0
 # The ported engine features (docs/PORT-RECIPE.md, docs/spill-and-kv-sharding.md): OFF by default (the recipe as
 # before the port). Turn them on here: SPILL_GIB=64 KV_SHARD=1 is what the pair was validated with (POOL left empty is
 # then derived from CONTEXT: 2,101,248 at the 1M window). Set here, a spill folder that fails its checks on either
