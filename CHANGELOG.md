@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- `zig/patches/0070-restore-after-drop.patch`, `0071-durable-lookup-reasons.patch` and
+  `0072-restore-after-drop-test.patch` (`0070` acts with `SPILL_GIB`): a prompt pass whose kept state its own
+  placement gave away for room asks the durable tier once, with its disk lookup open, and resumes at the durable
+  point instead of computing the prompt from 0; a second loss the same way prefills as before, so a store that
+  cannot serve the point does not loop. `0071` names why a durable lookup missed (`disk_queries`,
+  `disk_rejected_*`), and `0072` adds host tests on the fake tier. By **Phan Quý Nguyên
+  ([NguyenPhan2810](https://github.com/NguyenPhan2810))**, pull request #136.
+- `zig/patches/0054-keyed-draft.patch` (`TF_DS_T26_KEYED_DRAFT=1`, off) and `0055-device-draw.patch`
+  (`TF_DS_T27_DEVICE_DRAW=1`, off): the drafter takes the sampler's keyed Gumbel noise, and a sampled round draws
+  on the device instead of copying the logits to the host. Both are opt-in; unset, the engine is bit-identical.
+  On the author's engine line sampled prose rose 4.6% at temperature 0.7 and 7.2% at 1.0 (`0054`), and sampled
+  code 2.4% and prose 1.6% (`0055`); neither is measured on this recipe's image. `0052-prefill-slice.patch` and
+  `0053-expert-prune-cap.patch` come with them as the prerequisites their diffs were generated on: both are off
+  by default, and `0053` is **lossy** if `TF_DS_T13_EXPERT_PRUNE` / `_CAP` are set, so leave those unset. By
+  **Lukasz Raczylo ([lukaszraczylo](https://github.com/lukaszraczylo))**, pull requests #107-#110.
 - `start.sh` warns when `GRAPHS=1` and the pool (`POOL`, else `CONTEXT`) is not a multiple of 4096. A round's context
   bucket is capped at the pool (`round.zig` `bucketFor`), and an off-grid cap gives the indexer an `_index_score` tile
   count the kit has no captured variant for: at `CONTEXT=400000` a prompt past 262,144 positions failed with
