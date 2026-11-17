@@ -180,12 +180,12 @@ PREFILL_INTERLEAVE_MS="${PREFILL_INTERLEAVE_MS:-250}"
 # (--device CARD:CARD:rw), drop the DRM master the open grants (DROP_MASTER), then use three DRM ioctls on it
 # (MODE_CREATE_DUMB, MODE_MAP_DUMB, GEM_CLOSE) plus an mmap of the buffer: none needs DRM master or CAP_SYS_ADMIN (see
 # docs/memory-and-safety.md). Sharded (KV_SHARD=1) this rank's owner planes are placed on the reserve first.
-DISPLAY_KV_MIB="${DISPLAY_KV_MIB:-0}"
+DISPLAY_KV_MIB="${DISPLAY_KV_MIB:-${TF_DS_DISPLAY_KV_MIB:-0}}"
 # Empty (default): each rank resolves its GPU's card node from /dev/dri/by-path at start (display_kv_card). A set value
 # must be a /dev/dri/cardN node and is used on both ranks. cardN is NOT a stable name: firmware and other DRM devices
 # change the probe order (card0 -> card1 -> card0 on this pair across 11-06 and 11-16), which is why the by-path link
 # is the default and why the two ranks resolve separately (their numbering can differ).
-DISPLAY_KV_CARD="${DISPLAY_KV_CARD:-}"
+DISPLAY_KV_CARD="${DISPLAY_KV_CARD:-${TF_DS_DISPLAY_KV_CARD:-}}"
 # display_kv_card: the GPU's DRM card node by its PCI path (the by-path link survives renumbering), else card0.
 display_kv_card() {
   local p c drv
