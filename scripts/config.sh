@@ -172,6 +172,31 @@ REPLAY_FLOOR="${REPLAY_FLOOR:-1}"
 # rounds for the streams already live (and to their cancels): TF_DS_PREFILL_INTERLEAVE_MS, read by rank 0 only. 0: the pass runs to
 # its end first, as before. 250 is what PR #5 and this recipe measured. Each such stop costs the long prompt about the time given.
 PREFILL_INTERLEAVE_MS="${PREFILL_INTERLEAVE_MS:-250}"
+# zig/patches/0039: the KV caches on the framebuffer a headless GB10 reserves (UEFI, about 1.75 GiB a GPU; a DRM dumb
+# buffer on DISPLAY_KV_CARD mapped into the GPU's address space), so their bytes leave the host's MemAvailable. MiB of
+# it to use, whole steps of 16, at most 2032; the tensors that fit go there, the rest stay on ordinary memory. 0
+# (default): off. It needs no display connected to the card (the engine checks); both ranks take it.
+# TF_DS_DISPLAY_KV_MIB and TF_DS_DISPLAY_KV_CARD. The containers get the one card node, read-write without mknod
+# (--device CARD:CARD:rw), drop the DRM master the open grants (DROP_MASTER), then use three DRM ioctls on it
+# (MODE_CREATE_DUMB, MODE_MAP_DUMB, GEM_CLOSE) plus an mmap of the buffer: none needs DRM master or CAP_SYS_ADMIN (see
+# docs/memory-and-safety.md). Sharded (KV_SHARD=1) this rank's owner planes are placed on the reserve first.
+DISPLAY_KV_MIB="${DISPLAY_KV_MIB:-0}"
+# Empty (default): each rank resolves its GPU's card node from /dev/dri/by-path at start (display_kv_card). A set value
+# must be a /dev/dri/cardN node and is used on both ranks. cardN is NOT a stable name: firmware and other DRM devices
+# change the probe order (card0 -> card1 -> card0 on this pair across 11-06 and 11-16), which is why the by-path link
+# is the default and why the two ranks resolve separately (their numbering can differ).
+DISPLAY_KV_CARD="${DISPLAY_KV_CARD:-}"
+# display_kv_card: the GPU's DRM card node by its PCI path (the by-path link survives renumbering), else card0.
+display_kv_card() {
+  local p c drv
+  for p in /dev/dri/by-path/*-card; do
+    [[ -e "$p" ]] || continue
+    c=$(readlink -f "$p")
+    drv=$(readlink -f "/sys/class/drm/${c##*/}/device/driver" 2>/dev/null || true)
+    [[ "${drv##*/}" == nvidia ]] && { printf '%s\n' "$c"; return 0; }
+  done
+  printf '/dev/dri/card0\n'
+}
 
 # ---------------------------------------------------------------- files
 HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"

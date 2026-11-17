@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- `zig/patches/0039-display-kv.patch` (recipe setting `DISPLAY_KV_MIB`, off by default): the KV caches go on the
+  framebuffer a headless GB10 reserves at boot (a DRM dumb buffer on the card node, mapped above host pages in one
+  span), so those bytes leave the host's `MemAvailable`; the tensors that fit go there, the rest stay on host pages.
+  With `KV_SHARD=1` each rank's owner planes (its part's compressed codes and scales) are placed on the reserve
+  first. Ported back onto this branch's series: the patch applies after `0038` as `0039`, and two `model.zig` hunks
+  of `0053-expert-prune-cap.patch` are re-anchored onto its layout (`const max_world` before `Model`, the prune
+  methods after `makeCaches`). Measured on this pair at `POOL=5218304`/`DISPLAY_KV_MIB=1792`: 1,791 MiB a rank on
+  the reserve, 852 MiB left on host, `tools/exact.py` 39/39 identical.
+- `DISPLAY_KV_CARD` is resolved per rank from `/dev/dri/by-path` unless set: `cardN` is not a stable name (the pair
+  renumbered `card0` → `card1` on 11-06 and back on 11-16), so `start.sh` asks each Spark for its nvidia card and
+  passes that node to that rank's container (`--device CARD:CARD:rw`), refusing before anything is stopped if it
+  cannot find one.
 - `zig/patches/0070-restore-after-drop.patch`, `0071-durable-lookup-reasons.patch` and
   `0072-restore-after-drop-test.patch` (`0070` acts with `SPILL_GIB`): a prompt pass whose kept state its own
   placement gave away for room asks the durable tier once, with its disk lookup open, and resumes at the durable

@@ -1136,9 +1136,9 @@ index b89c95521..65ef5a5e8 100644
  
  /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
  pub const chunk_rows = 2048;
-@@ -125,6 +126,8 @@ pub const Options = struct {
-     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
- };
+@@ -146,6 +147,8 @@ pub fn maxRopeWindow(table_rows: usize, round_rows: usize) usize {
+     return extent -| (round_rows + 2);
+ }
  
 +const max_world = 4; // the 2D split
 +
@@ -1185,9 +1185,9 @@ index b89c95521..65ef5a5e8 100644
 +        return st;
 +    }
 +
-     /// The start-up's note of what it serves when the pool is not the window or the shard is on: the pool, its parts,
-     /// the single-conversation limit (below the window asked: said so, with the numbers), the compressed planes'
-     /// bytes a rank (calculated: rows by the formula; the arena's figure is the measured one).
+     /// The KV caches (`sh`: TF_DS_KV_SHARD's parts, null replicated): from the arena, or with TF_DS_DISPLAY_KV_MIB
+     /// (display.zig) the tensors that fit on the framebuffer reservation's half of one span and the rest on host pages
+     /// beside it. Sharded, this rank's owner planes (its part's compressed codes and scales) are the ones placed there
 diff --git a/zig/src/families/dsv41/ops.zig b/zig/src/families/dsv41/ops.zig
 index a82baee07..9dafc34d2 100644
 --- a/zig/src/families/dsv41/ops.zig

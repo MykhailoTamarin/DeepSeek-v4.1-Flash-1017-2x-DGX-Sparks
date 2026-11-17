@@ -33,6 +33,9 @@
 #            them, and a start waits up to MIN_AVAIL_WAIT_S for them to drain), MEMGUARD_GIB (kill a rank's container
 #            below it), HEAD_NFS_SERVER,
 #            HEAD_NFS_VOLUME (rank 0 reads the checkpoint over NFS through a docker volume)
+#   display  DISPLAY_KV_MIB (zig/patches/0039: MiB of the headless GB10's display reserve for the KV caches; 0 off,
+#            whole steps of 16 up to 2032), DISPLAY_KV_CARD (empty: each rank resolves its GPU's card node from
+#            /dev/dri/by-path, which survives the card0/card1 renumbering; a set /dev/dri/cardN is used on both)
 #   port     SPILL_GIB (default 0: off), SPILL_DIR, WORKER_SPILL_DIR, SPILL_FLOOR_GIB, SPILL_QUOTA_GIB, SPILL_MIN_TOKENS,
 #            SPILL_STAGING_MIB, SPILL_TURNS, SPILL_FLUSH_MS, SPILL_WEIGHTS_SHA, KV_SHARD (default 0: off), KV_SHARD_DECODE,
 #            KV_SHARD_CARRY, KV_SHARD_TWINS, KV_SHARD_CHECK (with KV_SHARD=1 an empty POOL is the pool it needs): the
@@ -77,6 +80,7 @@ for v in EAQ_V1_1 THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FL
 [[ "$RDMA_IDLE_S" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v value="$RDMA_IDLE_S" 'BEGIN { exit !(value <= 3600) }' || die "RDMA_IDLE_S is 0 to 3600 seconds (0 turns the nap off), not $RDMA_IDLE_S"
 [[ "$RDMA_NAP_US" =~ ^[1-9][0-9]*$ ]] && awk -v value="$RDMA_NAP_US" 'BEGIN { exit !(value <= 1000000) }' || die "RDMA_NAP_US is 1 to 1000000 microseconds, not $RDMA_NAP_US"
 [[ "${RANK1_PROFILE:-}" =~ ^[012]?$ ]] || die "RANK1_PROFILE is empty, 0, 1 or 2, not '${RANK1_PROFILE:-}'"
+[[ "$DISPLAY_KV_MIB" =~ ^[0-9]+$ ]] && (( DISPLAY_KV_MIB <= 2032 && DISPLAY_KV_MIB % 16 == 0 )) || die "DISPLAY_KV_MIB is 0 (off) or whole steps of 16 up to 2032, not $DISPLAY_KV_MIB"
 nccl_extra_collect
 check_workers
 need_workers
@@ -91,6 +95,24 @@ port_spill_check
 port_engram_check
 port_map
 port_check_extra "$@"
+# zig/patches/0039: display KV's card node, per rank. cardN is not a stable name (firmware and other DRM devices
+# renumber it: card0 -> card1 -> card0 on this pair across 11-06 and 11-16), so an empty DISPLAY_KV_CARD resolves each
+# Spark's nvidia card from /dev/dri/by-path; a set value is used on both ranks. Resolved here, before anything is
+# stopped, so a node that cannot be found refuses instead of failing a rank after the old server is gone.
+DISPLAY_KV_CARD0= DISPLAY_KV_CARD1=
+if (( DISPLAY_KV_MIB > 0 )); then
+  if [[ -n "$DISPLAY_KV_CARD" ]]; then
+    DISPLAY_KV_CARD0=$DISPLAY_KV_CARD; DISPLAY_KV_CARD1=$DISPLAY_KV_CARD
+  else
+    DISPLAY_KV_CARD0=$(display_kv_card)
+    DISPLAY_KV_CARD1=$DISPLAY_KV_CARD0
+    (( DRY )) || DISPLAY_KV_CARD1=$(worker 1 'for p in /dev/dri/by-path/*-card; do [ -e "$p" ] || continue; c=$(readlink -f "$p"); d=$(readlink -f "/sys/class/drm/${c##*/}/device/driver" 2>/dev/null); [ "${d##*/}" = nvidia ] && { echo "$c"; exit 0; }; done; echo /dev/dri/card0') || DISPLAY_KV_CARD1=$DISPLAY_KV_CARD0
+  fi
+  [[ "$DISPLAY_KV_CARD0" =~ ^/dev/dri/card[0-9]+$ ]] || die "DISPLAY_KV_CARD resolved to '$DISPLAY_KV_CARD0' here, not a /dev/dri/cardN node: set DISPLAY_KV_CARD explicitly"
+  [[ "$DISPLAY_KV_CARD1" =~ ^/dev/dri/card[0-9]+$ ]] || die "DISPLAY_KV_CARD resolved to '$DISPLAY_KV_CARD1' on $(worker_host 1), not a /dev/dri/cardN node: set DISPLAY_KV_CARD explicitly"
+  [[ -e "$DISPLAY_KV_CARD0" ]] || die "the display KV card node $DISPLAY_KV_CARD0 does not exist here: set DISPLAY_KV_CARD explicitly"
+  log "Display KV: ${DISPLAY_KV_MIB} MiB on $DISPLAY_KV_CARD0 here, $DISPLAY_KV_CARD1 on $(worker_host 1)"
+fi
 
 # rank 0's command (its serve flags need no link): built first, so the flags can be checked before anything is stopped
 SERVE=(tensorfold-native serve "$(served_in_container)" --backend cuda --host "$HOST" --port "$PORT" --name "$SERVED_NAME"
@@ -269,6 +291,7 @@ ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "TF_RDM
 [[ -z "$POOL" ]] || ENGINE_ENV+=("TF_DS_POOL=$POOL" "TF_DS_WINDOW=$CONTEXT")   # zig/patches/0008: both ranks, alike
 [[ -z "$ROUND_ROWS" ]] || ENGINE_ENV+=("TF_DS_ROUND_ROWS=$ROUND_ROWS")
 (( PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS")
+(( DISPLAY_KV_MIB == 0 )) || ENGINE_ENV+=("TF_DS_DISPLAY_KV_MIB=$DISPLAY_KV_MIB")   # zig/patches/0039: the MiB both ranks take
 ENGINE_ENV+=(${PORT_ENV[@]+"${PORT_ENV[@]}"})   # the ported features' variables, the same on both ranks (scripts/port.sh)
 ENGINE_ENV+=(${PORT_IDENT_ENV[@]+"${PORT_IDENT_ENV[@]}"})   # the spill tier's identity, the same on both ranks
 while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SPILL|TF_FILL)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|GRAPH_CAP|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP)=' | grep -vE "^(${PORT_MAPPED_RE:-^$})=" || true)
@@ -276,6 +299,13 @@ envs() { local x; for x in "$@"; do printf -- '-e %q ' "$x"; done; }
 RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --label tf.recipe.port=$(port_identity) --gpus all --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK --device /dev/infiniband"
 # each rank's container log rotates (LOG_MAX_SIZE, LOG_MAX_FILE; issue #49): the engine logs every response
 [[ -z "$LOG_MAX_SIZE" ]] || RUN_ARGS+=" --log-driver json-file --log-opt max-size=$LOG_MAX_SIZE --log-opt max-file=$LOG_MAX_FILE"
+# zig/patches/0039: each rank's own card node, read-write without mknod. Empty with DISPLAY_KV_MIB=0, so nothing changes.
+DISPLAY_DEV0= DISPLAY_DEV1= DISPLAY_ENV1=
+if (( DISPLAY_KV_MIB > 0 )); then
+  DISPLAY_DEV0="--device $DISPLAY_KV_CARD0:$DISPLAY_KV_CARD0:rw"
+  DISPLAY_DEV1="--device $DISPLAY_KV_CARD1:$DISPLAY_KV_CARD1:rw"
+  DISPLAY_ENV1="-e TF_DS_DISPLAY_KV_CARD=$DISPLAY_KV_CARD1"   # rank 1's node (its numbering can differ from ours)
+fi
 DATA=/hf/$DATA_SUB
 KIT=/hf/$KIT_SUB/kit
 # rank 1 takes the round's settings as flags only (tf-dsv41-lanes reads no TF_DS_GRAPHS & co.): without them it runs
@@ -311,7 +341,7 @@ step 3 "Launch: container $CONTAINER_NAME, rank 1 on the worker, then rank 0 her
 cmd="tf-dsv41-lanes $MODEL_ARG /rank-cache 1 2 ${LINK_HEAD_ADDR[1]:-$MASTER_ADDR} $MASTER_PORT $KIT --engram /engram --token-map $DATA/dsv41_token_map.json $FOLLOW"
 [[ "$RDMA" == 0 ]] || cmd+=" --rdma ${NODE_HCAS[1]}"   # this node's RoCE devices
 spill1=$(port_spill_args 1)   # rank 1's spill directory (scripts/port.sh; empty, and no extra space, with it off)
-remote="mkdir -p \$HOME/.cache/dsv41-tensorfold && docker run -d --name $CONTAINER_NAME $RUN_ARGS -v $NFS_VOLUME:/hf:ro -v $WORKER_ENGRAM_DIR:/engram:ro -v $WORKER_CACHE_DIR:/rank-cache:ro ${spill1:+$spill1 }$(envs "${ENGINE_ENV[@]}" "TF_RDMA_GID_INDEX=${NODE_GID[1]}" ${PORT_RANK_SHA[1]:+"TF_DS_RANK_CACHE_SHA=${PORT_RANK_SHA[1]}"} ${PORT_RANK1_ENV[@]+"${PORT_RANK1_ENV[@]}"}) $(rank_nccl_env 1) $IMAGE $cmd"
+remote="mkdir -p \$HOME/.cache/dsv41-tensorfold && docker run -d --name $CONTAINER_NAME $RUN_ARGS $DISPLAY_DEV1 -v $NFS_VOLUME:/hf:ro -v $WORKER_ENGRAM_DIR:/engram:ro -v $WORKER_CACHE_DIR:/rank-cache:ro ${spill1:+$spill1 }$(envs "${ENGINE_ENV[@]}" "TF_RDMA_GID_INDEX=${NODE_GID[1]}" ${PORT_RANK_SHA[1]:+"TF_DS_RANK_CACHE_SHA=${PORT_RANK_SHA[1]}"} ${PORT_RANK1_ENV[@]+"${PORT_RANK1_ENV[@]}"}) $DISPLAY_ENV1 $(rank_nccl_env 1) $IMAGE $cmd"
 if (( DRY )); then printf '[dry-run] rank 1 on %s:\n  %s\n' "$(worker_host 1)" "$remote"
 else
   log "Rank 1 on $(worker_host 1): $cmd"
@@ -321,12 +351,13 @@ ENV0=(TF_TP_WORLD=2 "TF_TP_MASTER=${LINK_HEAD_ADDR[1]:-$MASTER_ADDR}" "TF_TP_POR
       "TENSORFOLD_CUDA_KERNELS=$KIT/aot" "TF_DS_ENGRAM=$([[ -n "$HEAD_ENGRAM_DIR" ]] && echo /engram || engram_in_container)" "TF_DS_TOKEN_MAP=$DATA/dsv41_token_map.json"
       "TF_DS_GRAPHS=$GRAPHS" "TF_DS_GRAPH_CAP=$GRAPH_CAP" "TF_DS_HC_SIDE=$SIDE" "TF_DS_L2_PREFETCH=$PREFETCH" "TF_DS_ENGRAM_AIO=$ENGRAM_AIO" "TF_RDMA_GID_INDEX=${NODE_GID[0]}")
 if (( DRY )); then HEAD_HF=${HEAD_NFS_SERVER:+$HEAD_NFS_VOLUME}; HEAD_HF=${HEAD_HF:-$HF_CACHE}; else HEAD_HF=$(head_hf_mount); fi
-here=(docker run -d --name "$CONTAINER_NAME" $RUN_ARGS -v "$HEAD_HF:/hf:ro")
+here=(docker run -d --name "$CONTAINER_NAME" $RUN_ARGS ${DISPLAY_DEV0} -v "$HEAD_HF:/hf:ro")
 read -ra port0 <<<"$(port_spill_args 0)"; here+=(${port0[@]+"${port0[@]}"})   # rank 0's spill directory (scripts/port.sh)
 if [[ -n "$HEAD_ENGRAM_DIR" ]]; then
   here+=(-v "$HEAD_ENGRAM_DIR:/engram:ro")
 fi
 [[ "$RDMA" == 0 ]] || ENV0+=("TF_RDMA_DEVICES=${NODE_HCAS[0]}")
+(( DISPLAY_KV_MIB == 0 )) || ENV0+=("TF_DS_DISPLAY_KV_CARD=$DISPLAY_KV_CARD0")   # zig/patches/0039: this rank's node
 [[ -z "${PORT_RANK_SHA[0]:-}" ]] || ENV0+=("TF_DS_RANK_CACHE_SHA=${PORT_RANK_SHA[0]}")   # this rank's own weight file's
 if [[ "$API_KEY" == 1 ]]; then here+=(-v "$API_KEY_FILE:$API_KEY_IN_CONTAINER:ro"); fi
 for x in "${ENV0[@]}" "${ENGINE_ENV[@]}"; do here+=(-e "$x"); done
