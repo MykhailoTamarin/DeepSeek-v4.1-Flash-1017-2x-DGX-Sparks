@@ -134,7 +134,7 @@ index 041137257..497328031 100644
      /// fp32. A [k, 1] column is contiguous by torch's rules (a size-1 dimension's stride is not checked), so torch
      /// issues C^T = v^T x^T untransposed: transa N, transb N, m = 1, n = rows, lda = 1, ldb = k, ldc = 1 (cuBLAS runs it
 diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
-index c9509b5fc..e8ee6a314 100644
+index c9509b5fc..eadb76ed4 100644
 --- a/zig/src/families/dsv41/lanes.zig
 +++ b/zig/src/families/dsv41/lanes.zig
 @@ -40,7 +40,7 @@ pub const SpillFollower = spill_tier.Follower(Model.SpillDev);
@@ -258,6 +258,15 @@ index c9509b5fc..e8ee6a314 100644
              // TF_DS_KV_SHARD pins the twins for the whole chunk: it runs whole
              const sliced = m.slice_layers > 0 and self.kv == null and midWanted(s);
              if (!sliced) if (try self.begin(.fill_chunk)) {
+@@ -873,7 +917,7 @@ pub const Lanes = struct {
+                 break :blk if (sliced) try self.fillSliced(s, seq, .{ .start = start, .n = n, .replay = f.replay }) else try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
+             };
+             f.start += n;
+-            if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
++            if (s.reuse.hook) |k| if (f.start < len and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
+             // the host's work between this pass's chunks (Stream.between: the prefill interleave's rounds, parked work's
+             // service): the read-ahead joined and the prompt's ids gone first, as at a piece's end and on rank 1, which
+             // reads ahead again at the next chunk
 @@ -1131,7 +1175,7 @@ pub const Lanes = struct {
          }
          // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
