@@ -134,9 +134,18 @@ index 041137257..497328031 100644
      /// fp32. A [k, 1] column is contiguous by torch's rules (a size-1 dimension's stride is not checked), so torch
      /// issues C^T = v^T x^T untransposed: transa N, transb N, m = 1, n = rows, lda = 1, ldb = k, ldc = 1 (cuBLAS runs it
 diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
-index c9509b5fc..32022a250 100644
+index c9509b5fc..e8ee6a314 100644
 --- a/zig/src/families/dsv41/lanes.zig
 +++ b/zig/src/families/dsv41/lanes.zig
+@@ -40,7 +40,7 @@ pub const SpillFollower = spill_tier.Follower(Model.SpillDev);
+ 
+ comptime {
+     // parts.zig keeps lanes' block and growth slack (it is self-contained so `zig test` runs it alone)
+-    std.debug.assert(parts.chunk_rows == model.chunk_rows and parts.growth_rows == growth_rows);
++    std.debug.assert(parts.chunk_rows == model.resume_rows and parts.growth_rows == growth_rows);
+ }
+ 
+ /// A window of the pending row and the drafter's block: the widest one the gates checked row for row.
 @@ -212,12 +212,39 @@ fn clashes(used: []const [2]usize, lo: usize, hi: usize) bool {
      return false;
  }
@@ -477,6 +486,21 @@ index c90da4409..e371cd143 100644
 +    try std.testing.expectError(error.BadPassRows, passRows("3000"));
 +    try std.testing.expectError(error.BadPassRows, passRows("8192"));
 +}
+diff --git a/zig/src/families/dsv41/parts.zig b/zig/src/families/dsv41/parts.zig
+index c0c5eb2b7..8894fa994 100644
+--- a/zig/src/families/dsv41/parts.zig
++++ b/zig/src/families/dsv41/parts.zig
+@@ -42,8 +42,8 @@ const std = @import("std");
+ const builtin = @import("builtin");
+ const Allocator = std.mem.Allocator;
+ 
+-/// A pool block: model.chunk_rows (kept self-contained so `zig test` runs this file alone).
+-// (lanes.zig asserts parts.chunk_rows == model.chunk_rows and parts.growth_rows == growth_rows.)
++/// A pool block: model.resume_rows (kept self-contained so `zig test` runs this file alone).
++// (lanes.zig asserts parts.chunk_rows == model.resume_rows and parts.growth_rows == growth_rows.)
+ pub const chunk_rows: usize = 2048;
+ /// lanes.growth_rows: room left past a kept state's extent while placements fit so.
+ pub const growth_rows: usize = 16 * chunk_rows;
 diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
 index c46d862a3..9455b11a4 100644
 --- a/zig/src/families/dsv41/prompt.zig
