@@ -15,6 +15,9 @@ a fit of the 8000/20000 calibrations, check prompt_tokens), conv_A1 B1 C1 A2 B2 
 ~6K-token system prompts, interleaved A1 B1 C1 A2 B2 C2 A3, each turn appends the previous reply; cached_tokens is
 shown side by side in compare as information only), repeat_2048
 (identical prompt again, cached), resume_1..3 (one long prefix, 3 short suffixes, sequential) + resume_1_again,
+longresume_1..2 (a ~24K-token prefix, two suffixes) + longresume_1_again (the cold reply again through the cache: the
+cache must hit above position 8,192, where a pass runs 4,096 rows, and the resumed reply must be bit-identical),
+longconv_A1 A2 (a conversation with a ~20K-token system prompt: its second turn must resume the mark the first kept),
 conc_1..8 (8 at once, the qualified eight-stream baseline; --streams 4 for the old four) + solo_1..8. Prompt sizes are calibrated against usage.prompt_tokens (not exact for the long ones:
 compare the recorded prompt_tokens). --like FILE reuses the salt and word counts of an earlier record so the prompts
 are byte-identical. Without --like the salt is random (so a cold run is cold even on a warm server).
@@ -50,11 +53,13 @@ COLD_SIZES = [("len_1", 1), ("len_100", 100), ("len_2048", 2048), ("len_2049", 2
               ("len_64000", 64000), ("len_100000", 100000)]
 PREDICT_FROM = 30000      # targets at or above this are predicted from the 8000/20000 fits, not calibrated (too slow)
 CONV_SYS_TARGET = 6000
+LONG_CONV_SYS_TARGET = 20000   # a conversation whose history is past position 8,192 (a 4,096-row pass, a 2,048-grid mark)
 CONV_ORDER = ["A1", "B1", "C1", "A2", "B2", "C2", "A3"]
 CONV_Q = {"A": ["What is the first topic in the text above?", "Name two words that repeat in the text.", "Say one short sentence about the weather."],
           "B": ["Summarize the text above in five words.", "Which word comes last in the text?", "Reply with a number between one and nine."],
           "C": ["Give a title for the text above.", "List three nouns from the text.", "Say hello in a different way."]}
 RESUME_TARGET = 8000
+LONG_RESUME_TARGET = 24000     # a prefix past position 8,192: its pass runs 4,096 rows, its state lands on the 2,048 grid
 CONC_TARGETS = [600, 1200, 1800, 2400, 3000, 3600, 4200, 4800]   # the first four are the original cases
 OLD_STREAMS = 4                                                     # records without meta.conc_streams
 SUFFIXES = ["Summarize the text above in one sentence.",
@@ -203,9 +208,9 @@ def record(a) -> int:
     run = Runner(a)
     health = get_json(a.url, "/health")
     log(f"record: label={a.label!r} url={a.url} salt={salt} like={a.like}")
-    todo = [(n, t, 0 if t <= 2049 else max(2, t // 100)) for n, t in COLD_SIZES] + [("resume", RESUME_TARGET, 80)]
+    todo = [(n, t, 0 if t <= 2049 else max(2, t // 100)) for n, t in COLD_SIZES] + [("resume", RESUME_TARGET, 80), ("longresume", LONG_RESUME_TARGET, 120)]
     streams = a.streams
-    todo += [(f"conc_{i+1}", t, 20) for i, t in enumerate(CONC_TARGETS[:streams])] + [("convsys", CONV_SYS_TARGET, 60)]
+    todo += [(f"conc_{i+1}", t, 20) for i, t in enumerate(CONC_TARGETS[:streams])] + [("convsys", CONV_SYS_TARGET, 60), ("longconvsys", LONG_CONV_SYS_TARGET, 120)]
     cal = {}
     for name, tgt, tol in todo:
         if name in shape:
@@ -217,12 +222,19 @@ def record(a) -> int:
             shape[name] = max(1, int(tgt * ratio))
             log(f"  shape {name}: {shape[name]} words (derived from the --like record's conc shapes)")
             continue
+        if like and name in ("longresume", "longconvsys") and "len_20000" in shape:
+            # an older record predates these cases: derive each shape from that record's own len_20000 shape
+            # (deterministic, so two records --like the same file match)
+            tgt0 = LONG_RESUME_TARGET if name == "longresume" else LONG_CONV_SYS_TARGET
+            shape[name] = max(1, int(shape["len_20000"] * tgt0 / 20000))
+            log(f"  shape {name}: {shape[name]} words (derived from the --like record's len_20000 shape)")
+            continue
         if like:
             log(f"--like file has no shape for {name}")
             return 2
         if a.no_calibrate:
             shape[name] = max(0, int(tgt / 1.15)) if tgt > 1 else 0
-        elif tgt >= PREDICT_FROM and "len_8000" in cal and "len_20000" in cal:
+        elif (tgt >= PREDICT_FROM or name in ("longresume", "longconvsys")) and "len_8000" in cal and "len_20000" in cal:
             (n1, p1), (n2, p2) = cal["len_8000"], cal["len_20000"]
             b = (p2 - p1) / (n2 - n1)
             shape[name] = max(1, int((tgt - (p1 - b * n1)) / b))
@@ -253,6 +265,11 @@ def record(a) -> int:
     for i, s in enumerate(SUFFIXES):
         put(f"resume_{i+1}", RESUME_TARGET, run.text(f"{salt}-resume", n, s))
     put("resume_1_again", RESUME_TARGET, run.text(f"{salt}-resume", n, SUFFIXES[0]))
+    # a prefix past position 8,192: the pass runs 4,096-row chunks there and the state it keeps lands on the 2,048 grid
+    nl = shape["longresume"]
+    put("longresume_1", LONG_RESUME_TARGET, run.text(f"{salt}-longresume", nl, SUFFIXES[0]))
+    put("longresume_2", LONG_RESUME_TARGET, run.text(f"{salt}-longresume", nl, SUFFIXES[1]))
+    put("longresume_1_again", LONG_RESUME_TARGET, run.text(f"{salt}-longresume", nl, SUFFIXES[0]))
     conc = [(f"conc_{i+1}", run.text(f"{salt}-conc{i+1}", shape[f"conc_{i+1}"], "Summarize the text above in one sentence."))
             for i in range(streams)]
     with concurrent.futures.ThreadPoolExecutor(streams) as ex:
@@ -285,6 +302,22 @@ def record(a) -> int:
             dead.add(k)
         else:
             convs[k].append({"role": "assistant", "content": text})
+    # one conversation whose history is past position 8,192: the next turn resumes the mark its pass kept (the history's
+    # length floored to the 2,048-row grid), where a pass runs 4,096 rows. Its turns carry >128 tokens of their own, so
+    # the floored mark is always before the replay point (a shorter turn could land within the window and keep nothing)
+    lc = [{"role": "system", "content": f"[ref {salt}-longconv]\n" + words(shape["longconvsys"], a.seed + 7)}]
+    lcq = [words(200, a.seed + 11) + "\n\nWhat is the first topic in the text above?",
+           words(200, a.seed + 12) + "\n\nName two words that repeat in the text."]
+    for turn, q in zip(("A1", "A2"), lcq):
+        lc.append({"role": "user", "content": q})
+        r = run.ask(list(lc))
+        text = r.pop("_text", "")
+        r["target_tokens"] = LONG_CONV_SYS_TARGET
+        cases[f"longconv_{turn}"] = r
+        log(f"  longconv_{turn}: " + (r["error"] if "error" in r else
+            f"prompt={r['prompt_tokens']} out={r['completion_tokens']} cached={r['cached_tokens']} sha={r['token_sha'][:12]} {r['seconds']}s"))
+        if "error" not in r:
+            lc.append({"role": "assistant", "content": text})
 
     def chk(name, ok, detail=""):
         checks.append({"check": name, "ok": bool(ok), "detail": detail})
@@ -294,11 +327,12 @@ def record(a) -> int:
         return "error" not in cases[x] and "error" not in cases[y] and cases[x]["token_sha"] == cases[y]["token_sha"]
     chk("repeat_2048 == len_2048", same("repeat_2048", "len_2048"))
     chk("resume_1_again == resume_1", same("resume_1_again", "resume_1"))
+    chk("longresume_1_again == longresume_1", same("longresume_1_again", "longresume_1"))
     for i in range(1, streams + 1):
         chk(f"solo_{i} == conc_{i}", same(f"solo_{i}", f"conc_{i}"))
     c = cases["repeat_2048"].get("cached_tokens")
     log(f"  info: repeat_2048 cached_tokens={c} (informational: a 2048-token prompt may keep no snapshot)")
-    for nm in ("resume_2", "resume_3"):
+    for nm in ("resume_2", "resume_3", "longresume_2", "longresume_1_again", "longconv_A2"):
         c = cases[nm].get("cached_tokens")
         if c is None:
             checks.append({"check": f"{nm} cache hit", "ok": True, "detail": "server reports no cached_tokens (not checked)"})
@@ -308,7 +342,7 @@ def record(a) -> int:
     weak = sorted(n for n, c in cases.items() if "error" not in c and c.get("token_sha_source") != "server")
     if weak:
         log(f"WARNING: the server gave no tensorfold.token_sha for {len(weak)} case(s): this record is WEAK (text hash only); compare refuses it without --allow-weak")
-    meta = {"schema": SCHEMA, "prompt_set": PROMPT_SET, "conc_streams": streams, "weak": bool(weak), "label": a.label, "drafts_label": a.drafts, "drafts_observed": drafts_seen,
+    meta = {"schema": SCHEMA, "prompt_set": PROMPT_SET, "conc_streams": streams, "long_resume": True, "weak": bool(weak), "label": a.label, "drafts_label": a.drafts, "drafts_observed": drafts_seen,
             "url": a.url, "model": a.model, "salt": salt, "seed": a.seed, "max_tokens": a.max_tokens, "shape": shape,
             "like": a.like, "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "health": {k: health.get(k) for k in ("status", "model", "max_batch_size", "error")}}
@@ -354,6 +388,9 @@ def compare(pa, pb, allow_weak=False) -> int:
             if k.isdigit() and int(k) > lacking.get("conc_streams", OLD_STREAMS):
                 print(f"note     {n}: only in {'B' if a is None else 'A'} ({'A' if a is None else 'B'} recorded "
                       f"{lacking.get('conc_streams', OLD_STREAMS)} concurrent streams)")
+                continue
+            if (n.startswith("longresume_") or n.startswith("longconv_")) and not lacking.get("long_resume"):
+                print(f"note     {n}: only in {'B' if a is None else 'A'} (that record predates the long-context cache cases)")
                 continue
             print(f"MISMATCH {n}: present only in {'B' if a is None else 'A'}")
             bad += 1
