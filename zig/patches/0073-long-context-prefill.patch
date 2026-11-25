@@ -10,9 +10,12 @@
 # 1.9 GiB a node of prompt scratch instead of 4.6 (the 2,048-row build's 2.5). Not run on a pair in this recipe.
 #
 # The recipe's own choices: the spill tier's block size stays the 2,048-row resume grid (model.resume_rows), so the
-# existing 2,048-row store and its fingerprint are kept; the extents stay aligned to the 4,096-row chunk (chunk_rows),
-# as the tp2 branch has them. At CONTEXT=1,048,576 and MAX_TOKENS=65,536 a full-window request reserves 1,118,208
-# positions (aligned to 4,096), so two fit in POOL >= 2,236,416; the recipe's 2,232,320 (aligned to 2,048) holds one.
+# existing 2,048-row store and its fingerprint are kept. The prompt cache's grid is that same resume grid, not the
+# 4,096-row pass rows: a pass runs 4,096 rows, but every state it keeps lands on the 2,048 grid, so a cache gridded on
+# the pass rows would pass over a state kept at 6,144 (or 2,048) as off-grid. Extents stay aligned to the 4,096-row
+# chunk (chunk_rows), as the tp2 branch has them. At CONTEXT=1,048,576 and MAX_TOKENS=65,536 a full-window request
+# reserves 1,118,208 positions (aligned to 4,096), so two fit in POOL >= 2,236,416; the recipe's 2,232,320 (aligned to
+# 2,048) holds one.
 # With TF_DS_PROMPT_ALIAS=1 and TF_DS_PASS_ROWS=4096 the 4,096-row scratch fits the arena; without the alias it is
 # ~4.6 GiB and may not. TF_DS_PASS_ROWS=2048 keeps the 2,048-row passes, but the chunk's scratch is still sized for
 # 4,096 rows; the alias is the way to make that fit.
@@ -134,7 +137,7 @@ index 041137257..497328031 100644
      /// fp32. A [k, 1] column is contiguous by torch's rules (a size-1 dimension's stride is not checked), so torch
      /// issues C^T = v^T x^T untransposed: transa N, transb N, m = 1, n = rows, lda = 1, ldb = k, ldc = 1 (cuBLAS runs it
 diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
-index c9509b5fc..eadb76ed4 100644
+index c9509b5fc..e8ee6a314 100644
 --- a/zig/src/families/dsv41/lanes.zig
 +++ b/zig/src/families/dsv41/lanes.zig
 @@ -40,7 +40,7 @@ pub const SpillFollower = spill_tier.Follower(Model.SpillDev);
@@ -258,15 +261,6 @@ index c9509b5fc..eadb76ed4 100644
              // TF_DS_KV_SHARD pins the twins for the whole chunk: it runs whole
              const sliced = m.slice_layers > 0 and self.kv == null and midWanted(s);
              if (!sliced) if (try self.begin(.fill_chunk)) {
-@@ -873,7 +917,7 @@ pub const Lanes = struct {
-                 break :blk if (sliced) try self.fillSliced(s, seq, .{ .start = start, .n = n, .replay = f.replay }) else try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
-             };
-             f.start += n;
--            if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
-+            if (s.reuse.hook) |k| if (f.start < len and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
-             // the host's work between this pass's chunks (Stream.between: the prefill interleave's rounds, parked work's
-             // service): the read-ahead joined and the prompt's ids gone first, as at a piece's end and on rank 1, which
-             // reads ahead again at the next chunk
 @@ -1131,7 +1175,7 @@ pub const Lanes = struct {
          }
          // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
@@ -436,7 +430,7 @@ index 7ad02f6bc..4cf49db97 100644
                      eh.ahead_n = nn;
                      eh.ahead_ready = .{ false, false };
 diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
-index c90da4409..e371cd143 100644
+index c90da4409..202611a11 100644
 --- a/zig/src/families/dsv41/native.zig
 +++ b/zig/src/families/dsv41/native.zig
 @@ -26,6 +26,10 @@
@@ -468,7 +462,18 @@ index c90da4409..e371cd143 100644
      // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
      st.vision = null;
      if (st.m.cfg.vision) st.vision = try vision_mod.Vision.open(gpa, io, st.m, dir, getenv("TF_DS_KIT").?);
-@@ -658,6 +664,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+@@ -294,7 +300,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     const kv_parts: ?lanes.kv_parts.Source = if (st.m.kvs != null) .{ .ctx = &st.lanes, .read = L.kvPartsFn } else null;
+     const pair: ?Pair = if (pair_mode == .exit) .{ .watch = pairWatch, .abort = pairAbort } else null;
+     if (pair != null) std.log.info("dsv41: a broken rank pair ends this server with status {d} for a restart of both ranks (TF_DS_PAIR_BROKEN=degrade: requests fail one by one instead)", .{api.LaneHost.pair_exit_code});
+-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window), .kv_parts = kv_parts, .pair = pair, .quiet = quietFn };
++    // the prompt cache's grid is the resume grid, not the pass rows: a pass runs up to model.chunk_rows, but the states
++    // it keeps land on model.resume_rows (Snapshots.save, Lanes.usable), and a state off the cache's grid is never found
++    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.resume_rows, .replay = @intCast(st.m.cfg.window), .kv_parts = kv_parts, .pair = pair, .quiet = quietFn };
+ }
+ 
+ // -- the broken-pair policy (robustness, docs/port/robustness.md) ------------------------------------------------
+@@ -658,6 +666,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
          error.BadPromptGemmRows => rows_mod.gemm_hint,
          error.PromptRowsMismatch => "TF_DS_PROMPT_WINDOW_ROWS / TF_DS_PROMPT_GEMM_ROWS: the ranks run different prompt paths; set them alike on every rank (tf-dsv41-lanes reads them too)",
          error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
@@ -476,7 +481,7 @@ index c90da4409..e371cd143 100644
          error.BadGraphCap => "TF_DS_GRAPH_CAP: the captured CUDA graphs kept at most, a count (0: all)",
          error.BadPlainRows => "TF_DS_PLAIN_ROWS: the rows a mixed pack's plain linear runs over, 0 (the round's own) or a count up to TF_DS_ROUND_ROWS",
          error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
-@@ -959,3 +966,18 @@ test "a follower killed mid-round: the link watch stops the collectives and the
+@@ -959,3 +968,18 @@ test "a follower killed mid-round: the link watch stops the collectives and the
      try std.testing.expect(!host.pair_drain);
      try std.testing.expectEqual(api.LaneHost.pair_exit_code, stuck.code.load(.acquire));
  }

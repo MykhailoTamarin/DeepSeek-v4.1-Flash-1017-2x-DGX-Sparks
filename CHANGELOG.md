@@ -10,9 +10,12 @@
   of 4.6 (the 2,048-row build's 2.5). Ported from BertholomusAI's two-node branch `deepseek-v41-zig-tp2`
   v0.7.1-v0.7.5 (commits `3bb1d042d`, `6456bf12d`, `42bcdeb97`, `1ec959ee0`, `37b7d2651`, `3befde133`,
   `bfa786f42`, `3b902fd21`); on their pair prompt 93,335 tokens went 2,136 -> 2,355 tok/s (+10%) and 128K
-  2,428 -> 2,547 (+5%). Not run on a pair in this recipe. The spill tier's block size stays 2,048 (the existing
-  store); extents stay 4,096-aligned, so at `CONTEXT=1048576` / `MAX_TOKENS=65536` two full-window requests need
-  `POOL >= 2236416`.
+  2,428 -> 2,547 (+5%). The spill tier's block size stays 2,048 (the existing store) and the prompt cache's grid is
+  that same 2,048-row resume grid, not the 4,096-row pass rows: a pass runs 4,096 rows, but its kept states land on
+  the 2,048 grid, so a cache gridded on the pass rows would pass over a state kept at 6,144 (or 2,048). Extents stay
+  4,096-aligned, so at `CONTEXT=1048576` / `MAX_TOKENS=65536` two full-window requests need `POOL >= 2236416`.
+  Measured on this pair at `POOL=2236416`, `PROMPT_ALIAS=1`: prefill 8K 2,040 -> 2,177 tok/s (+6.7%), 32K
+  2,075 -> 2,367 (+14.0%), 64K 1,884 -> 2,092 (+11.0%), 128K 1,842 -> 2,022 (+9.8%); TTFT down 6-12%.
 - `zig/patches/0060-long-session-cache.patch` (unsharded placement, with or without spill): a cached prefix no longer
   evicts itself when its continuation needs more than half the pool and a separate copy cannot fit. Under pressure it
   grows in place, invalidating only idle states in the overwritten tail; live streams and loading restores are
