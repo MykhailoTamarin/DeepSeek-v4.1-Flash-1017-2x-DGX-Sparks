@@ -186,6 +186,10 @@ DISPLAY_KV_MIB="${DISPLAY_KV_MIB:-${TF_DS_DISPLAY_KV_MIB:-0}}"
 # change the probe order (card0 -> card1 -> card0 on this pair across 11-06 and 11-16), which is why the by-path link
 # is the default and why the two ranks resolve separately (their numbering can differ).
 DISPLAY_KV_CARD="${DISPLAY_KV_CARD:-${TF_DS_DISPLAY_KV_CARD:-}}"
+# TF_DS_PROMPT_ALIAS (zig/patches/0073): the prompt pass's large scratch in five shared regions, ~1.6 GiB a rank less
+# at 2,048 rows and a 1M context. On by default here: the 4,096-row pass's scratch is ~4.6 GiB without it (1.9 with),
+# and the recipe's arena holds the latter. 0: off (the served take). TP2 only; the ranks need not agree.
+PROMPT_ALIAS="${PROMPT_ALIAS:-${TF_DS_PROMPT_ALIAS:-1}}"
 # display_kv_card: the GPU's DRM card node by its PCI path (the by-path link survives renumbering), else card0.
 display_kv_card() {
   local p c drv

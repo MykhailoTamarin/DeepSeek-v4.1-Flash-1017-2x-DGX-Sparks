@@ -287,14 +287,16 @@ foreground() {
 # zig/patches/0037: how long rank 1 retries its connect to rank 0 (seconds, default 300); both ranks refuse anything else
 [[ -z "${TF_DS_CONNECT_S:-}" ]] || { [[ "$TF_DS_CONNECT_S" =~ ^[1-9][0-9]{0,4}$ ]] && (( TF_DS_CONNECT_S <= 86400 )); } ||
   die "TF_DS_CONNECT_S is a count of seconds from 1 to 86400, not $TF_DS_CONNECT_S"
+[[ "$PROMPT_ALIAS" =~ ^[01]$ ]] || die "PROMPT_ALIAS (TF_DS_PROMPT_ALIAS) is 0 or 1, not $PROMPT_ALIAS"
 ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "TF_RDMA_IDLE_S=$RDMA_IDLE_S" "TF_RDMA_NAP_US=$RDMA_NAP_US" "HF_HUB_OFFLINE=$HF_HUB_OFFLINE")
 [[ -z "$POOL" ]] || ENGINE_ENV+=("TF_DS_POOL=$POOL" "TF_DS_WINDOW=$CONTEXT")   # zig/patches/0008: both ranks, alike
 [[ -z "$ROUND_ROWS" ]] || ENGINE_ENV+=("TF_DS_ROUND_ROWS=$ROUND_ROWS")
 (( PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS")
 (( DISPLAY_KV_MIB == 0 )) || ENGINE_ENV+=("TF_DS_DISPLAY_KV_MIB=$DISPLAY_KV_MIB")   # zig/patches/0039: the MiB both ranks take
+ENGINE_ENV+=("TF_DS_PROMPT_ALIAS=$PROMPT_ALIAS")   # zig/patches/0073: the pass's scratch in shared regions
 ENGINE_ENV+=(${PORT_ENV[@]+"${PORT_ENV[@]}"})   # the ported features' variables, the same on both ranks (scripts/port.sh)
 ENGINE_ENV+=(${PORT_IDENT_ENV[@]+"${PORT_IDENT_ENV[@]}"})   # the spill tier's identity, the same on both ranks
-while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SPILL|TF_FILL)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|GRAPH_CAP|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP|DISPLAY_KV_MIB|DISPLAY_KV_CARD)=' | grep -vE "^(${PORT_MAPPED_RE:-^$})=" || true)
+while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SPILL|TF_FILL)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|GRAPH_CAP|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP|DISPLAY_KV_MIB|DISPLAY_KV_CARD|PROMPT_ALIAS)=' | grep -vE "^(${PORT_MAPPED_RE:-^$})=" || true)
 envs() { local x; for x in "$@"; do printf -- '-e %q ' "$x"; done; }
 RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --label tf.recipe.port=$(port_identity) --gpus all --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK --device /dev/infiniband"
 # each rank's container log rotates (LOG_MAX_SIZE, LOG_MAX_FILE; issue #49): the engine logs every response

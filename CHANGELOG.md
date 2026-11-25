@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- `zig/patches/0073-long-context-prefill.patch` (`TF_DS_PASS_ROWS` / `TF_DS_PASS_FROM`; the recipe's `PROMPT_ALIAS`,
+  default 1, passes `TF_DS_PROMPT_ALIAS`): a prompt pass runs up to 4,096 rows from position 8,192 on (2,048 below it), on a 2,048-row
+  resume grid, with the gate and indexer fp32 cuBLAS calls split at 2,048 rows and the host row tables sized for
+  8,192; the Engram read-ahead is sized by the next pass, and a stepped pass runs on while nothing else waits.
+  `TF_DS_PROMPT_ALIAS=1` puts the pass's large scratch in five shared regions: 1.9 GiB a node at 4,096 rows instead
+  of 4.6 (the 2,048-row build's 2.5). Ported from BertholomusAI's two-node branch `deepseek-v41-zig-tp2`
+  v0.7.1-v0.7.5 (commits `3bb1d042d`, `6456bf12d`, `42bcdeb97`, `1ec959ee0`, `37b7d2651`, `3befde133`,
+  `bfa786f42`, `3b902fd21`); on their pair prompt 93,335 tokens went 2,136 -> 2,355 tok/s (+10%) and 128K
+  2,428 -> 2,547 (+5%). Not run on a pair in this recipe. The spill tier's block size stays 2,048 (the existing
+  store); extents stay 4,096-aligned, so at `CONTEXT=1048576` / `MAX_TOKENS=65536` two full-window requests need
+  `POOL >= 2236416`.
 - `zig/patches/0060-long-session-cache.patch` (unsharded placement, with or without spill): a cached prefix no longer
   evicts itself when its continuation needs more than half the pool and a separate copy cannot fit. Under pressure it
   grows in place, invalidating only idle states in the overwritten tail; live streams and loading restores are

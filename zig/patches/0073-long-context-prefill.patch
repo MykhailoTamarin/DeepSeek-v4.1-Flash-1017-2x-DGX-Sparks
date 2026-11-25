@@ -1,0 +1,772 @@
+# 0073-long-context-prefill: a prompt pass runs up to 4,096 rows above position 8,192, on a 2,048-row resume grid,
+# with the gate/indexer fp32 GEMMs split at 2,048 rows, host row tables for passes up to 8,192, the Engram read-ahead
+# sized by the next pass, and (TF_DS_PROMPT_ALIAS=1) the prompt pass's large scratch in five shared regions.
+#
+# Ported from BertholomusAI's two-node branch deepseek-v41-zig-tp2 (v0.7.1-v0.7.5): 3bb1d042d (chunk_rows 4096),
+# 6456bf12d (fp32 GEMMs split at 2048), 42bcdeb97 (host row tables 8192), 1ec959ee0 (resume points on the 2048 grid),
+# 37b7d2651 (TF_DS_PASS_ROWS/TF_DS_PASS_FROM, 2048 below 8192), 3befde133 (Engram read-ahead sized by the next pass),
+# bfa786f42 (a stepped pass runs on while nothing else waits), 3b902fd21 (TF_DS_PROMPT_ALIAS). Their measurements on
+# a two-Spark pair: prompt 93,335 tokens 2,136 -> 2,355 tok/s (+10%), 128K 2,428 -> 2,547 (+5%); TF_DS_PROMPT_ALIAS
+# 1.9 GiB a node of prompt scratch instead of 4.6 (the 2,048-row build's 2.5). Not run on a pair in this recipe.
+#
+# The recipe's own choices: the spill tier's block size stays the 2,048-row resume grid (model.resume_rows), so the
+# existing 2,048-row store and its fingerprint are kept; the extents stay aligned to the 4,096-row chunk (chunk_rows),
+# as the tp2 branch has them. At CONTEXT=1,048,576 and MAX_TOKENS=65,536 a full-window request reserves 1,118,208
+# positions (aligned to 4,096), so two fit in POOL >= 2,236,416; the recipe's 2,232,320 (aligned to 2,048) holds one.
+# With TF_DS_PROMPT_ALIAS=1 and TF_DS_PASS_ROWS=4096 the 4,096-row scratch fits the arena; without the alias it is
+# ~4.6 GiB and may not. TF_DS_PASS_ROWS=2048 keeps the 2,048-row passes, but the chunk's scratch is still sized for
+# 4,096 rows; the alias is the way to make that fit.
+#
+# Switches: TF_DS_PASS_ROWS=N (a multiple of 2,048 from 2,048 to 4,096; unset 4,096), TF_DS_PASS_FROM=P (a position;
+# unset 8,192), TF_DS_PROMPT_ALIAS=1 (off; TP2 only). The ranks need not agree on TF_DS_PROMPT_ALIAS (a rank's own
+# memory); TF_DS_PASS_ROWS/TF_DS_PASS_FROM are rank 0's pass rule, the follower reads the frames.
+#
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 97d5d1b5b..847d9ce36 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -457,6 +457,16 @@ pub const LaneHost = struct {
+         return job.host.closing or std.mem.indexOfScalar(Id, job.host.cancels.items, job.id) != null;
+     }
+ 
++    /// Whether work besides this job's prompt pass waits (a queued request, another pass, a decoding stream, a cancel):
++    /// a stepped pass then ends its step after its chunks, else it runs on (asked on the engine thread, between chunks).
++    fn othersWait(ctx: *anyopaque) bool {
++        const job: *Job = @ptrCast(@alignCast(ctx));
++        const h = job.host;
++        h.lock();
++        defer h.unlock();
++        return h.queued.items.len > 0 or (h.filling != null and h.filling.? != job) or h.core.activeCount() > 0 or h.cancels.items.len > 0 or h.closing;
++    }
++
+     /// Hands a stream the tokens its rounds committed since the last delivery.
+     fn send(h: *LaneHost, job: *Job) void {
+         const emitted = job.stream.emitted();
+@@ -655,6 +665,7 @@ pub const LaneHost = struct {
+             .proposer = job.proposer.proposer(),
+             .stop_check = if (r.stop) |s| .{ .ptr = s.ctx, .check = s.check } else null,
+             .cancel_check = .{ .ptr = job, .check = cancelled },
++            .share_check = .{ .ptr = job, .check = othersWait },
+             .think_budget = r.think_budget,
+             .think_close = r.think_close,
+             .think_end = if (r.think_end) |t| t else -1,
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index a16396d3a..50d8b3483 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -132,6 +132,7 @@ pub const Spec = struct {
+     proposer: ?Proposer = null,
+     stop_check: ?StopCheck = null,
+     cancel_check: ?CancelCheck = null,
++    share_check: ?CancelCheck = null, // a stepped prompt pass: other work waits, so its step ends after its chunks
+     think_budget: u32 = 0,
+     think_close: []const u32 = &.{},
+     think_end: i64 = -1,
+@@ -170,6 +171,7 @@ pub const Stream = struct {
+     proposer: ?Proposer,
+     stop_check: ?StopCheck,
+     cancel_check: ?CancelCheck,
++    share_check: ?CancelCheck = null,
+     think_budget: u32,
+     think_close: []const u32,
+     think_end: i64,
+@@ -243,6 +245,7 @@ pub const Stream = struct {
+             .proposer = if (spec.drafts) spec.proposer else null,
+             .stop_check = spec.stop_check,
+             .cancel_check = spec.cancel_check,
++            .share_check = spec.share_check,
+             .think_budget = spec.think_budget,
+             .think_close = spec.think_close,
+             .think_end = spec.think_end,
+@@ -307,6 +310,13 @@ pub const Stream = struct {
+         return c.check(c.ptr);
+     }
+ 
++    /// Whether a stepped prompt pass ends its step after its chunks (true with no hook: every step ends there);
++    /// false while nothing else waits, so a pass alone runs on as a whole pass does. Asked after each chunk.
++    pub fn shares(s: *const Stream) bool {
++        const c = s.share_check orelse return true;
++        return c.check(c.ptr);
++    }
++
+     fn budgetActive(s: *const Stream) bool {
+         return s.think_open and s.think_budget > 0 and s.think_close.len > 0;
+     }
+@@ -511,3 +521,19 @@ test "loop guard fires, closes thinking, and latches once" {
+     _ = try s.commit(gpa, &.{8});
+     try std.testing.expect(!s.finished and s.loop_period.? == 1);
+ }
++
++test "shares: a stepped pass ends its step with no hook, runs on while its hook says nothing waits" {
++    const Flag = struct {
++        fn check(ptr: *anyopaque) bool {
++            return @as(*bool, @ptrCast(@alignCast(ptr))).*;
++        }
++    };
++    var waits = false;
++    var s: Stream = undefined;
++    s.share_check = null;
++    try std.testing.expect(s.shares());
++    s.share_check = .{ .ptr = &waits, .check = Flag.check };
++    try std.testing.expect(!s.shares());
++    waits = true;
++    try std.testing.expect(s.shares());
++}
+diff --git a/zig/src/families/dsv41/cublas.zig b/zig/src/families/dsv41/cublas.zig
+index 041137257..497328031 100644
+--- a/zig/src/families/dsv41/cublas.zig
++++ b/zig/src/families/dsv41/cublas.zig
+@@ -81,6 +81,16 @@ pub const Blas = struct {
+         try b.check(b.api.cublasSgemm_v2(b.handle, .t, .n, @intCast(n), @intCast(rows), @intCast(k), &one, w, @intCast(k), x, @intCast(k), &zero, out, @intCast(n)));
+     }
+ 
++    /// xwT in row blocks of `step` rows (the last block takes the rest): cuBLAS picks its algorithm (tiles, split-K) from
++    /// the shape, so a pass longer than `step` gives each row the bits of the `step`-row call a `step`-row pass makes.
++    pub fn xwTRows(b: *const Blas, x: u64, w: u64, out: u64, rows: usize, k: usize, n: usize, step: usize) Error!void {
++        var at: usize = 0;
++        while (at < rows) : (at += step) {
++            const r = @min(step, rows - at);
++            try b.xwT(x + at * k * 4, w, out + at * n * 4, r, k, n);
++        }
++    }
++
+     /// torch.matmul of x [rows, k] fp32 (row-major) and v [1, k] fp32 transposed (the DSpark confidence head): out [rows]
+     /// fp32. A [k, 1] column is contiguous by torch's rules (a size-1 dimension's stride is not checked), so torch
+     /// issues C^T = v^T x^T untransposed: transa N, transb N, m = 1, n = rows, lda = 1, ldb = k, ldc = 1 (cuBLAS runs it
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index c9509b5fc..32022a250 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -212,12 +212,39 @@ fn clashes(used: []const [2]usize, lo: usize, hi: usize) bool {
+     return false;
+ }
+ 
+-/// Whether one of the prompt cache's marks has its chunk end at `at` (each kept at the chunk end at or before it).
++/// Whether one of the prompt cache's marks has its resume point at `at` (each kept at the resume point at or before it).
+ fn markEnds(marks: []const u32, at: usize) bool {
+-    for (marks) |w| if (w / model.chunk_rows * model.chunk_rows == at) return true;
++    for (marks) |w| if (w / model.resume_rows * model.resume_rows == at) return true;
+     return false;
+ }
+ 
++/// A pass of `n` rows from `start` cut to end at the first state it keeps (the last resume point or a mark's), so that
++/// state stands at a pass end.
++fn cutAtKeep(marks: []const u32, last_end: usize, replay: usize, len: usize, start: usize, n: usize) usize {
++    var end = start + n;
++    if (last_end > start and last_end < end) end = last_end;
++    for (marks) |w| {
++        const k = w / model.resume_rows * model.resume_rows;
++        if (k > start and k < end and k <= replay and k < len) end = k;
++    }
++    return end - start;
++}
++
++test "cutAtKeep ends a long pass at the resume point it keeps" {
++    const r = model.resume_rows;
++    const c = model.chunk_rows;
++    // no state to keep inside: the whole pass
++    try std.testing.expectEqual(@as(usize, c), cutAtKeep(&.{}, 0, 10 * r, 10 * r, 0, c));
++    // the last resume point inside the pass
++    try std.testing.expectEqual(@as(usize, r), cutAtKeep(&.{}, 3 * r, 10 * r, 10 * r, 2 * r, c));
++    // a mark floors to its resume point; the nearer of the two wins
++    try std.testing.expectEqual(@as(usize, r), cutAtKeep(&.{@intCast(3 * r + 5)}, 9 * r, 10 * r, 10 * r, 2 * r, c));
++    // a mark past the replay or at the prompt's end keeps nothing
++    try std.testing.expectEqual(@as(usize, c), cutAtKeep(&.{@intCast(r)}, 0, r - 1, 10 * r, 0, c));
++    // a resume point at the pass end needs no cut
++    try std.testing.expectEqual(@as(usize, c), cutAtKeep(&.{@intCast(c)}, c, 10 * r, 10 * r, 0, c));
++}
++
+ // -- pictures in a resumed pass (recipe 0006; spill v2 restores take the same path as memory resumes) ------------------
+ 
+ /// A picture's span [at, at + tokens) of the runtime sequence `seq` (the prompt's ids, each the placeholder `image_id`
+@@ -280,7 +307,7 @@ test "pictures in a resumed pass: spans dead in the sequence, rows only for thos
+ }
+ 
+ /// Room left past a kept state's extent while placements fit so, for its conversation's next turn to resume in place.
+-pub const growth_rows = 16 * model.chunk_rows;
++pub const growth_rows = 16 * model.resume_rows;
+ 
+ /// The first fit of `size` clear of `live` and of kept extents plus growth_rows, else of their extents, else of their rows.
+ pub fn placeSoft(gpa: std.mem.Allocator, live: []const [2]usize, kept: []const [3]usize, size: usize, cap: usize) !?usize {
+@@ -432,7 +459,7 @@ pub const Snap = struct {
+ };
+ 
+ /// Kept states this long or longer say so in the log when they go stale (their prompts then run again from 0).
+-const note_rows = 32 * model.chunk_rows;
++const note_rows = 32 * model.resume_rows;
+ 
+ fn noteStale(sn: *const Snap, why: []const u8) void {
+     if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} goes stale: {s}", .{ sn.at, sn.base, why });
+@@ -481,6 +508,11 @@ const held_wait_ns: u64 = 10 * std.time.ns_per_s;
+ /// First tokens a handle names (each prompt's draw, read back right after its prefill).
+ const ring = 1024;
+ 
++/// Below this position a prompt pass runs model.resume_rows rows: a 4096-row pass scores its own later keys in the
++/// indexer, which costs more than it saves near the prompt's start (slot pps: the 8K row 2,798 tok/s from 8192 vs
++/// 2,650 from 0; 128K 2,947 vs 2,949).
++pub const pass_from_default = 8192;
++
+ pub const Lanes = struct {
+     gpa: std.mem.Allocator,
+     m: *Model,
+@@ -506,6 +538,11 @@ pub const Lanes = struct {
+     next_snap: u64 = 1,
+     fill: ?Fill = null, // the prompt pass that runs in pieces between rounds, from its next chunk
+     paused: ?Fill = null, // the pass a short prompt cut into (lanes' cut_in), resumed by its next piece
++    // a prompt pass's rows at most: model.resume_rows below TF_DS_PASS_FROM positions (default pass_from_default),
++    // then TF_DS_PASS_ROWS (a multiple of model.resume_rows up to model.chunk_rows; unset: model.chunk_rows). The same
++    // bits at any: a pass ends on the resume grid either way
++    pass_rows: usize = model.chunk_rows,
++    pass_from: usize = pass_from_default,
+     spill: ?*SpillTier = null, // --spill-dir/--spill-gib: the spill tier (native.zig opens it; null: off, nothing changes)
+     kv: ?*kv_lanes.Kv = null, // TF_DS_KV_SHARD: the parts' planner (startKv, at open; null: the switch off)
+     kv_stats: lanes.kv_parts.Stats = .{}, // the last parts' stats kvPartsFn built (the engine loop reads them every
+@@ -822,6 +859,11 @@ pub const Lanes = struct {
+         return of(ptr).prefillPart(s, chunks);
+     }
+ 
++    /// A prompt pass's rows at most when it starts at `start`.
++    pub fn passCap(self: *const Lanes, start: usize) usize {
++        return if (start < self.pass_from) model.resume_rows else self.pass_rows;
++    }
++
+     fn prefillPart(self: *Lanes, s: *lanes.Stream, chunks: usize) !bool {
+         const m = self.m;
+         // TF_DS_KV_SHARD: a pass in pieces keeps its extent and part between them (the planner moves decoding streams
+@@ -852,11 +894,13 @@ pub const Lanes = struct {
+             m.fill_seq = &.{};
+         }
+         var ran: usize = 0;
+-        while (f.start < f.len and ran < chunks) : (ran += 1) {
++        // past its chunks the pass runs on while nothing else waits (s.shares), so a pass alone runs as a whole one
++        while (f.start < f.len and (ran < chunks or !s.shares())) : (ran += 1) {
+             const start = f.start;
+             const len = f.len;
+             if (start > 0 and s.isCancelled()) return error.Cancelled;
+-            const n = @min(model.chunk_rows, len - start);
++            const n = cutAtKeep(s.reuse.marks, f.last_end, f.replay, len, start, @min(self.passCap(start), len - start));
++            m.next_rows = self.passCap(start + n);
+             // TF_DS_KV_SHARD pins the twins for the whole chunk: it runs whole
+             const sliced = m.slice_layers > 0 and self.kv == null and midWanted(s);
+             if (!sliced) if (try self.begin(.fill_chunk)) {
+@@ -1131,7 +1175,7 @@ pub const Lanes = struct {
+         }
+         // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
+         // kept prompt), each at the chunk end at or before it
+-        const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
++        const last_end = @min(replay, len - 1) / model.resume_rows * model.resume_rows;
+         self.fill = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start, .base = base, .restored = if (kept) |sn| sn.restored else false, .part = if (parted) |pp| pp.id else null };
+     }
+ 
+@@ -1338,7 +1382,7 @@ pub const Lanes = struct {
+     fn usable(self: *const Lanes, sn: *const Snap, len: usize) bool {
+         if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return false;
+         if (self.kv) |k| if (k.planner.keptIndex(sn.id) == null) return false; // (TF_DS_KV_SHARD: its rows the planner holds)
+-        return !sn.stale and !sn.loading and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
++        return !sn.stale and !sn.loading and sn.at > 0 and sn.at < len and sn.at % model.resume_rows == 0 and sn.at <= len -| self.m.cfg.window;
+     }
+ 
+     /// The first extent that fits around the live streams and the kept states. Kept states give their room oldest
+@@ -1437,7 +1481,7 @@ pub const Lanes = struct {
+         const self = of(ptr);
+         const s: *const lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
+         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
+-        if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
++        if (at == 0 or at % model.resume_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
+         const sn = try self.gpa.create(Snap);
+         errdefer self.gpa.destroy(sn);
+         sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .part = l.part, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()), .slot = @intCast(l.slot) };
+@@ -2754,7 +2798,7 @@ test "TF_DS_KV_SHARD lanes: a carried token's bytes are the owners' rows over wh
+     const config = @import("config.zig");
+     var why: config.Why = .{};
+     const cfg = try config.parse(std.testing.allocator, config.test_config, &why);
+-    const lay = try spill_tier_state.StateLayout.fromConfig(&cfg, spill_tier_state.Geometry.of(&cfg, model.chunk_rows, 16, 64), .owner_sharded);
++    const lay = try spill_tier_state.StateLayout.fromConfig(&cfg, spill_tier_state.Geometry.of(&cfg, model.resume_rows, 16, 64), .owner_sharded);
+     try std.testing.expectEqual(@as(usize, 720), lay.owner_token_bytes);
+ }
+ 
+@@ -2814,7 +2858,7 @@ const CompositePeer = struct {
+         var l = try link.Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p.port, 10);
+         defer l.close();
+         const shapes = [_]spill_tier_state.LayerShape{ .{ .ratio = 2, .kv = true, .idx = true, .raw = true }, .{ .ratio = 1, .kv = true, .idx = true } };
+-        const raw = try spill_tier_state.StateLayout.init(&shapes, .{ .block_tokens = model.chunk_rows, .window = 8, .ring_extra = 4, .raw_rows = 4, .head_dim = 64, .index_head_dim = 64 }, .owner_sharded);
++        const raw = try spill_tier_state.StateLayout.init(&shapes, .{ .block_tokens = model.resume_rows, .window = 8, .ring_extra = 4, .raw_rows = 4, .head_dim = 64, .index_head_dim = 64 }, .owner_sharded);
+         const layout = try raw.withParts(p.cfg.cap / 2);
+         const settings: spill_tier.Settings = .{ .dir = p.root, .gib = 1, .min_free_gib = 0, .min_tokens = model.chunk_rows, .staging_bytes = 64 << 20, .readers = 1 };
+         const plan = try spill_tier.stagingPlan(settings, &layout);
+@@ -2823,7 +2867,7 @@ const CompositePeer = struct {
+         const events = try gpa.alloc(u32, spill_tier.eventCount(plan));
+         defer gpa.free(events);
+         for (events, 0..) |*e, i| e.* = @intCast(i);
+-        const sf = try MiniSpill.create(gpa, std.testing.io, 1, miniFx(1), null, .{ .dev = .{}, .layout = layout, .gens = try spill_tier_state.Generations.init(gpa, p.cfg.cap, model.chunk_rows), .settings = settings, .max_tokens = @intCast(p.cfg.cap / 2), .staging = staging, .events = events });
++        const sf = try MiniSpill.create(gpa, std.testing.io, 1, miniFx(1), null, .{ .dev = .{}, .layout = layout, .gens = try spill_tier_state.Generations.init(gpa, p.cfg.cap, model.resume_rows), .settings = settings, .max_tokens = @intCast(p.cfg.cap / 2), .staging = staging, .events = events });
+         defer sf.destroy();
+         var dev: kv_lanes.FakeDev = .{ .gpa = gpa };
+         defer dev.deinit();
+@@ -2979,3 +3023,14 @@ test "spill + shard: an owner-sharded reserve lands only on the follower planner
+     other.generation = 0;
+     try std.testing.expectError(error.SpillNotAgreed, pf.reserve(h, other));
+ }
++
++test "passCap: resume_rows below pass_from, then pass_rows" {
++    var ln: Lanes = undefined;
++    ln.pass_rows = model.chunk_rows;
++    ln.pass_from = 0;
++    try std.testing.expectEqual(@as(usize, model.chunk_rows), ln.passCap(0));
++    ln.pass_from = 4 * model.resume_rows;
++    try std.testing.expectEqual(@as(usize, model.resume_rows), ln.passCap(0));
++    try std.testing.expectEqual(@as(usize, model.resume_rows), ln.passCap(3 * model.resume_rows));
++    try std.testing.expectEqual(@as(usize, model.chunk_rows), ln.passCap(4 * model.resume_rows));
++}
+diff --git a/zig/src/families/dsv41/lanes_main.zig b/zig/src/families/dsv41/lanes_main.zig
+index 5ea01c314..28263616d 100644
+--- a/zig/src/families/dsv41/lanes_main.zig
++++ b/zig/src/families/dsv41/lanes_main.zig
+@@ -307,7 +307,7 @@ pub fn main(init: std.process.Init) !u8 {
+     if (spill != null) {
+         const L = dsv41.lanes.Lanes;
+         snap_vt = .{ .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .usable = L.usableFn };
+-        store_v = pcache.Store.init(gpa, .{ .ptr = &ln, .vtable = &snap_vt }, .{ .grid = dsv41.model.chunk_rows, .window = @intCast(m.cfg.window) }, @intFromFloat(cache_gib * (1 << 30)));
++        store_v = pcache.Store.init(gpa, .{ .ptr = &ln, .vtable = &snap_vt }, .{ .grid = dsv41.model.resume_rows, .window = @intCast(m.cfg.window) }, @intFromFloat(cache_gib * (1 << 30)));
+         var seed: [4]u8 = undefined;
+         io.random(&seed);
+         store_v.setTier(ln.spill.?.tier(), std.mem.readInt(u32, &seed, .little));
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 7ad02f6bc..4cf49db97 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -37,7 +37,11 @@ const prompt_rows = @import("prompt_rows.zig");
+ const expert_prune = @import("expert_prune.zig");
+ 
+ /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
+-pub const chunk_rows = 2048;
++pub const chunk_rows = 4096;
++/// Rows between resume points: the served build's 2048-row grid. Kept states land on it; a pass is cut short to end at
++/// the next one it keeps, so a longer pass resumes where a 2048-row pass would. Also the spill tier's block size, kept
++/// at the 2048-row store this recipe has.
++pub const resume_rows = 2048;
+ 
+ /// A prompt chunk runs in slices of this many layers at most, a decode round between two (TF_DS_PREFILL_SLICE; 0: the whole chunk).
+ pub const max_slice_layers = 40;
+@@ -215,6 +219,8 @@ pub const Model = struct {
+     // Engram rows during this one (fillChunk), joined before the prompt can change (joinAhead)
+     fill_seq: []const i32 = &.{},
+     ahead: ?std.Thread = null,
++    // the next prompt pass's rows at most (the lanes' pass rule): the Engram read-ahead reads that many, no more
++    next_rows: usize = chunk_rows,
+     // TF_DS_ENGRAM_LEAD=1: each Engram layer's prompt rows a chunk ahead on its own reader, in place of `ahead`
+     lead: engram_lead.Lead = .{},
+     view: prompt.Caches = undefined,
+@@ -1110,7 +1116,7 @@ pub const Model = struct {
+             s.* = .{ .ratio = if (kv) lay.ratio else 0, .kv = kv, .idx = kv and lay.idx_wk != null, .raw = kv and lay.ratio > 1 };
+         }
+         const sh = m.caches.shard;
+-        const raw = try spill.StateLayout.init(shapes[0..layers.len], spill.Geometry.of(m.eng.c, chunk_rows, prompt.ring_extra, prompt.raw_rows), if (sh != null) .owner_sharded else .replicated);
++        const raw = try spill.StateLayout.init(shapes[0..layers.len], spill.Geometry.of(m.eng.c, resume_rows, prompt.ring_extra, prompt.raw_rows), if (sh != null) .owner_sharded else .replicated);
+         const l = if (sh) |x| try raw.withParts(x.part) else raw;
+         if (l.small_bytes != m.snapBytes() or m.rings.len != layers.len) return error.SpillLayoutMismatch;
+         const dv: SpillDev = .{ .m = @constCast(m) };
+@@ -1124,7 +1130,7 @@ pub const Model = struct {
+ 
+     /// The pool's extent and slot generations (one counter a chunk of positions), sized once at setup.
+     pub fn spillGenerations(m: *const Model, gpa: std.mem.Allocator) !spill.Generations {
+-        return spill.Generations.init(gpa, m.caches.cap, chunk_rows);
++        return spill.Generations.init(gpa, m.caches.cap, resume_rows);
+     }
+ 
+     /// A packer over this rank's planes, `l` from spillLayout and `g` from spillGenerations (both the caller's, alive
+@@ -1199,7 +1205,7 @@ pub const Model = struct {
+         if (m.caches.shard != null) return error.SpillSelfCheckSharded;
+         if (from_slot >= m.streams or to_slot >= m.streams or from_slot == to_slot) return error.BadSlot;
+         if (at == 0) return error.BadRange;
+-        for ([_]usize{ from, to, ref, at }) |v| if (v % chunk_rows != 0) return error.BadRange;
++        for ([_]usize{ from, to, ref, at }) |v| if (v % resume_rows != 0) return error.BadRange;
+         const cap = m.caches.cap;
+         for ([_]usize{ from, to, ref }) |b| if (b >= cap or at > cap - b) return error.BadRange;
+         for ([_][2]usize{ .{ from, to }, .{ from, ref }, .{ to, ref } }) |p| if (p[0] < p[1] + at and p[1] < p[0] + at) return error.BadRange;
+@@ -1266,7 +1272,7 @@ pub const Model = struct {
+         var in_block: usize = 0; // plane j's offset in a block (copyExtent's order and widths)
+         var in_rows: usize = 0; // plane j's offset in ref_rows
+         for (refs) |rp| {
+-            const per = chunk_rows / rp.ratio * rp.row;
++            const per = resume_rows / rp.ratio * rp.row;
+             for (0..nb) |k| {
+                 if (!std.mem.eql(u8, b.bytes[k * l.block_bytes + in_block ..][0..per], ref_rows[in_rows + k * per ..][0..per])) return error.SpillLayoutMismatch;
+             }
+@@ -1394,12 +1400,12 @@ pub const Model = struct {
+                 m.lead.begin(eh, c, seq, start, n);
+                 break :ref;
+             }
+-            if (ahead != null and (eh.ahead_start != start or eh.ahead_n != n)) {
++            if (ahead != null and (eh.ahead_start != start or eh.ahead_n < n)) {
+                 ahead.?.join();
+                 ahead = null;
+             }
+             // rows read ahead that ended before a round or a piece's end are this chunk's when they cover it, both layers
+-            const whole = eh.ahead_start == start and eh.ahead_n == n and eh.ahead_err == null and eh.ahead_ready[0] and (c.engram_layers.slice().len < 2 or eh.ahead_ready[1]);
++            const whole = eh.ahead_start == start and eh.ahead_n >= n and eh.ahead_err == null and eh.ahead_ready[0] and (c.engram_layers.slice().len < 2 or eh.ahead_ready[1]);
+             if (ahead == null and !whole) {
+                 eh.ahead_start = start;
+                 eh.ahead_n = n;
+@@ -1463,7 +1469,7 @@ pub const Model = struct {
+                         rs.ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, j + 1 }) catch null;
+                 } else if (m.fill_seq.len > start + n and m.fill_seq.ptr == seq.ptr) {
+                     // the next chunk's rows while this one's layers run
+-                    const nn = @min(chunk_rows, m.fill_seq.len - start - n);
++                    const nn = @min(m.next_rows, m.fill_seq.len - start - n);
+                     eh.ahead_start = start + n;
+                     eh.ahead_n = nn;
+                     eh.ahead_ready = .{ false, false };
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index c90da4409..e371cd143 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -26,6 +26,10 @@
+ //!   TF_DS_PROMPT_GEMM_ROWS=<rows>               a prompt chunk over these rows (16 .. 128; 128 unset) takes the prefill GEMM for the
+ //!                                               dense linears in place of the glinear group; bits may differ (set alike on every
+ //!                                               rank: a mismatch ends the start)
++//!   TF_DS_PASS_ROWS=N, TF_DS_PASS_FROM=P        a prompt pass's rows at most (a multiple of 2,048 up to the build's
++//!                                               pass rows), passes of 2,048 below position P (8192 unless set)
++//!   TF_DS_PROMPT_ALIAS=1                        the prompt pass's large scratch in five shared regions (~1.6 GiB
++//!                                               less a rank at 2,048 rows and a 1M context); TP2 only
+ //!   TF_DS_PLAIN_ROWS                            the rows a mixed pack's plain (cuBLAS) linear runs over, padded to this
+ //!                                               count so a token's bits do not change with the round's shape (16; 0: off)
+ //!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (else NCCL)
+@@ -101,7 +105,7 @@ pub const formats: []const []const u8 = &.{"exl3-mul1"};
+ pub const default_context: i64 = 262144;
+ pub const max_segments: u32 = 1;
+ /// The served build's prompt chunk (TF_DS_PREFILL_CHUNK).
+-pub const prompt_rows: u32 = 2048;
++pub const prompt_rows: u32 = 4096;
+ /// The served lane's reasoning effort numbers (text.zig): the server passes each name and the template hears its number.
+ pub const efforts = @import("text.zig").efforts;
+ 
+@@ -277,6 +281,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     st.lanes.draft_cal = if (getenv("TF_DS_T25_DRAFT_CAL")) |v| lanes_mod.parseCalWeight(v) catch return error.BadDraftCal else 0.0;
+     st.lanes.cal_log = if (getenv("TF_DS_T25_CAL_LOG")) |v| std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch return error.BadCalLog else 0;
+     st.lanes.no_copies = if (getenv("TF_DS_NO_COPIES")) |v| !std.mem.eql(u8, v, "0") else false;
++    if (getenv("TF_DS_PASS_ROWS")) |t| st.lanes.pass_rows = try passRows(t);
++    if (getenv("TF_DS_PASS_FROM")) |t| st.lanes.pass_from = std.fmt.parseInt(usize, t, 10) catch return error.BadPassRows;
+     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
+     st.vision = null;
+     if (st.m.cfg.vision) st.vision = try vision_mod.Vision.open(gpa, io, st.m, dir, getenv("TF_DS_KIT").?);
+@@ -658,6 +664,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.BadPromptGemmRows => rows_mod.gemm_hint,
+         error.PromptRowsMismatch => "TF_DS_PROMPT_WINDOW_ROWS / TF_DS_PROMPT_GEMM_ROWS: the ranks run different prompt paths; set them alike on every rank (tf-dsv41-lanes reads them too)",
+         error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
++        error.BadPassRows => "TF_DS_PASS_ROWS: a multiple of 2,048 from 2,048 to the build's pass rows; TF_DS_PASS_FROM: a position",
+         error.BadGraphCap => "TF_DS_GRAPH_CAP: the captured CUDA graphs kept at most, a count (0: all)",
+         error.BadPlainRows => "TF_DS_PLAIN_ROWS: the rows a mixed pack's plain linear runs over, 0 (the round's own) or a count up to TF_DS_ROUND_ROWS",
+         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
+@@ -959,3 +966,18 @@ test "a follower killed mid-round: the link watch stops the collectives and the
+     try std.testing.expect(!host.pair_drain);
+     try std.testing.expectEqual(api.LaneHost.pair_exit_code, stuck.code.load(.acquire));
+ }
++
++/// TF_DS_PASS_ROWS: a multiple of the resume grid, at most the build's pass rows.
++fn passRows(t: []const u8) !usize {
++    const n = std.fmt.parseInt(usize, t, 10) catch return error.BadPassRows;
++    if (n == 0 or n % model.resume_rows != 0 or n > model.chunk_rows) return error.BadPassRows;
++    return n;
++}
++
++test "passRows takes multiples of the resume grid up to the pass rows" {
++    try std.testing.expectEqual(@as(usize, model.resume_rows), try passRows("2048"));
++    try std.testing.expectEqual(@as(usize, model.chunk_rows), try passRows("4096"));
++    try std.testing.expectError(error.BadPassRows, passRows("0"));
++    try std.testing.expectError(error.BadPassRows, passRows("3000"));
++    try std.testing.expectError(error.BadPassRows, passRows("8192"));
++}
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index c46d862a3..9455b11a4 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -48,6 +48,12 @@ const key_elems: usize = 1 << 24;
+ /// 2^26 / (4 n_comp) < 512).
+ const pruned_rows: usize = 512;
+ 
++/// The rows of one fp32 cuBLAS call in a prompt pass (the gate logits, the indexer weights): the 2048-row passes the
++/// served build makes. A longer pass splits these two calls at it, so its rows keep the served bits.
++pub const pass_gemm_rows = 2048;
++/// The longest prompt pass the host-side row tables (vis, the compressor groups) hold.
++pub const max_pass_rows = 8192;
++
+ /// model.py's RING_EXTRA: window ring slots beyond the window (a verify window never clobbers a key it reads).
+ pub const ring_extra = 16;
+ /// model.py's RAW: per-position compressor inputs kept (a ratio-2 group's earlier row for the next chunk).
+@@ -109,6 +115,45 @@ pub const Arena = struct {
+     }
+ };
+ 
++/// TF_DS_PROMPT_ALIAS's shared regions (Chunk.init): each member's field, its region and its bytes as its own take
++/// would take them; place() takes each region once at its largest member's bytes and points every member at its start.
++/// Off: every member's own take, in the served order (the same pieces at the same places).
++const Regions = struct {
++    on: bool,
++    size: [5]usize = @splat(0),
++    at: [32]*u64 = undefined,
++    of: [32]u8 = undefined,
++    n: usize = 0,
++    used: usize = 0, // the members' bytes
++
++    fn take(r: *Regions, a: *Arena, g: u8, p: *u64, bytes: usize) !void {
++        if (!r.on) {
++            p.* = try a.take(bytes);
++            return;
++        }
++        if (r.n == r.at.len) return error.TooManySharedBuffers;
++        r.size[g] = @max(r.size[g], bytes);
++        r.at[r.n] = p;
++        r.of[r.n] = g;
++        r.n += 1;
++        r.used += bytes;
++        p.* = 0;
++    }
++
++    fn place(r: *Regions, a: *Arena) !void {
++        if (!r.on) return;
++        var base: [5]u64 = @splat(0);
++        var total: usize = 0;
++        for (r.size, &base) |s, *b| {
++            if (s == 0) continue;
++            b.* = try a.take(s);
++            total += s;
++        }
++        for (r.at[0..r.n], r.of[0..r.n]) |p, g| p.* = base[g];
++        std.log.info("the prompt pass's scratch: {d} buffers of {d} MiB in shared regions of {d} MiB (TF_DS_PROMPT_ALIAS)", .{ r.n, r.used >> 20, total >> 20 });
++    }
++};
++
+ /// A RoPE kind's tables on the device: cos, sin fp32 [rows, rope_dim / 2] (ops.RopeTables' rows).
+ pub const Rope = struct { cos: u64, sin: u64 };
+ 
+@@ -299,6 +344,31 @@ pub const Chunk = struct {
+         const o_lora = l0.wo_a[0].n;
+         const ex = l0.experts;
+         const sl = e.slots();
++        aliasEnv();
++        // TF_DS_PROMPT_ALIAS: the large scratch in five regions, a region's members never live at once, each written
++        // whole by its own launches before a read:
++        //   0: ekg (the Engram gather), xs.z (the experts), ws.w (inside a GEMM), cand (a keyed indexer), gm (a MoE
++        //      gather to the next layer's first mix), ga (the attention gather to the FFN mixes), score (an indexer
++        //      from the candidate source on), xf (the index weights' and the gate's fp32 rows)
++        //   1: ek (the Engram layers), keys (a keyed indexer: before the candidate source), pool (the candidate source
++        //      to the last indexer), taps (the first tap layer to the chunk's end)
++        //   2: xs.xg, xs.xd (the experts), kv (the Engram sum), o, pa (the attention's out and partial), pm (the
++        //      experts' partial to its gather), pidx (the candidate source's blocks), iq (the index queries before fp4)
++        //   3: xs.xu (the experts), q (the queries to the sparse attention), u (wo_a to wo_b)
++        //   4: ws.xh (inside a GEMM), iq4 (the fp4 index queries, between GEMMs)
++        // Never shared: h, h_alt and x, cidx (from an indexer to the next), the experts' grouping (ids, count, counts,
++        // members), xsd (its epoch), cuBLAS's workspace, gxh, gz and the counters (rounds and the drafter), neg, every
++        // and ws.h (filled once). Region 1 needs its layers in that order; the four-node split has buffers of its own.
++        if (alias) {
++            if (e.two != null) return notPorted(@src());
++            var last: usize = 0; // the last indexer or Engram layer: the taps come after it
++            for (e.w.layers, 0..) |lay, li| {
++                if (lay.engram_wkv != null and li >= c.candidate_source) return error.PromptAliasLayers;
++                if (lay.idx_wq_b != null or lay.engram_wkv != null) last = li;
++            }
++            for (c.dspark_taps.slice()) |li| if (@as(usize, li) <= last) return error.PromptAliasLayers;
++        }
++        var rg: Regions = .{ .on = alias };
+         var ch: Chunk = undefined;
+         ch.spans = &.{};
+         ch.img_rows = 0;
+@@ -329,13 +399,13 @@ pub const Chunk = struct {
+         ch.qa = try a.take(cap * l0.wq_a.n * 2);
+         ch.y = try a.take(cap * hd * 2);
+         ch.qr = try a.take(cap * l0.wq_a.n * 2);
+-        ch.q = try a.take(cap * hl * hd * 2);
++        try rg.take(a, 3, &ch.q, cap * hl * hd * 2);
+         ch.wsrc = try a.take((c.window - 1 + cap) * hd * 2);
+         ch.wlo = try a.take(8);
+-        ch.o = try a.take(cap * hl * hd * 2);
+-        ch.u = try a.take(cap * groups * o_lora * 2);
+-        ch.pa = try a.take(cap * d * 4);
+-        ch.ga = try a.take(e.world * cap * d * 4);
++        try rg.take(a, 2, &ch.o, cap * hl * hd * 2);
++        try rg.take(a, 3, &ch.u, cap * groups * o_lora * 2);
++        try rg.take(a, 2, &ch.pa, cap * d * 4);
++        try rg.take(a, 0, &ch.ga, e.world * cap * d * 4);
+         ch.neg = try a.take(cap * 8);
+         ch.ring_idx = try a.take((c.window + ring_extra) * 8);
+         ch.rslot = try a.take(ring_extra * 8);
+@@ -343,15 +413,15 @@ pub const Chunk = struct {
+         ch.pl_ = try a.take(ring_extra * hl * tri_attn.attn_splits * 4);
+         ch.po_ = try a.take(ring_extra * hl * tri_attn.attn_splits * hd * 4);
+         ch.invalid = try a.take(4);
+-        ch.xf = try a.take(cap * d * 4);
++        try rg.take(a, 0, &ch.xf, cap * d * 4);
+         ch.gate_f = try a.take(c.experts * d * 4);
+         ch.logits = try a.take(cap * c.experts * 4);
+         ch.pick = try a.take(cap * sl * 4);
+         ch.wts = try a.take(cap * sl * 4);
+         ch.pick_vl = try a.take(cap * sl * 4);
+         ch.wts_vl = try a.take(cap * sl * 4);
+-        ch.pm = try a.take(cap * d * 4);
+-        ch.gm = try a.take(e.world * cap * d * 4);
++        try rg.take(a, 2, &ch.pm, cap * d * 4);
++        try rg.take(a, 0, &ch.gm, e.world * cap * d * 4);
+         // compressed layers: the smallest ratio sets the most compressed entries a row can see
+         var min_ratio: usize = 0;
+         for (e.w.layers) |lay| {
+@@ -368,16 +438,16 @@ pub const Chunk = struct {
+             ch.groups = try a.take(cap * 8);
+             ch.gpos = try a.take(cap * 8);
+             ch.raw_idx = try a.take(raw_rows * 8);
+-            ch.iq = try a.take(cap * ih * 2);
+-            ch.iq4 = try a.take(cap * ih * 2);
++            try rg.take(a, 2, &ch.iq, cap * ih * 2);
++            try rg.take(a, 4, &ch.iq4, cap * ih * 2);
+             ch.wl = try a.take(cap * c.index_heads * 4);
+             ch.iw = try a.take(cap * c.index_heads * 2);
+             ch.vis = try a.take(cap * 8);
+             ch.vis_blk = try a.take(cap * 8);
+             // the indexer's row blocks keep rows * n_comp under 2^24 (model.py rb), so their keys under key_elems
+             const ke: usize = @min(cap * ch.max_comp, key_elems); // (typed: @min with a comptime bound narrows)
+-            ch.keys = try a.take(ke * 8);
+-            ch.score = try a.take(ke * 4);
++            try rg.take(a, 1, &ch.keys, ke * 8);
++            try rg.take(a, 0, &ch.score, ke * 4);
+             ch.tmax = try a.take((ke / tri_index.tile + cap) * 8);
+             ch.cidx = try a.take(cap * c.index_topk * 8);
+             ch.ktop = try a.take(cap * c.index_topk * 8);
+@@ -386,9 +456,9 @@ pub const Chunk = struct {
+             const cb = c.candidate_block;
+             ch.pool_ms = (ch.max_comp + cb - 1) / cb;
+             if (ch.pool_ms > c.candidate_blocks) {
+-                ch.pool = try a.take(cap * ch.pool_ms);
++                try rg.take(a, 1, &ch.pool, cap * ch.pool_ms);
+                 ch.bmax = try a.take(@max(16 * ch.pool_ms, key_elems / cb + cap) * 4);
+-                ch.pidx = try a.take(cap * c.candidate_blocks * 8);
++                try rg.take(a, 2, &ch.pidx, cap * c.candidate_blocks * 8);
+             }
+             ch.every = try a.take(cap * 8);
+             {
+@@ -399,26 +469,26 @@ pub const Chunk = struct {
+                 try e.s.synchronize(); // (the host copy is freed next)
+             }
+             if (tri_index.prunes(ch.max_comp, c.index_topk)) {
+-                ch.pbufs = .{ .tpos = try a.take(pruned_rows * c.index_topk * 8), .cand = try a.take(pruned_rows * c.index_topk * tri_index.tile * 8), .every = ch.every };
++                ch.pbufs = .{ .tpos = try a.take(pruned_rows * c.index_topk * 8), .cand = 0, .every = ch.every };
++                try rg.take(a, 0, &ch.pbufs.cand, pruned_rows * c.index_topk * tri_index.tile * 8);
+             }
+         }
+         for (e.w.layers) |lay| {
+             const ew = lay.engram_wkv orelse continue;
+             const en = if (e.two) |t| t.engramWidth() else ew.n; // the summed projection's width (2D: both pairs')
+             ch.eb = try a.take(cap * ew.k * 2);
+-            ch.ek = try a.take(cap * ew.n * 4);
+-            ch.ekg = try a.take(e.world * cap * en * 4);
+-            ch.kv = try a.take(cap * en * 2);
++            try rg.take(a, 1, &ch.ek, cap * ew.n * 4);
++            try rg.take(a, 0, &ch.ekg, e.world * cap * en * 4);
++            try rg.take(a, 2, &ch.kv, cap * en * 2);
+             break;
+         }
+         const sz = exl3_experts.Scratch.sizes(cap, sl, ex.dims, ex.width, ex.count);
+-        var xs: exl3_experts.Scratch = undefined;
+-        xs.rows = cap;
+-        xs.slots = sl;
++        ch.xs.rows = cap;
++        ch.xs.slots = sl;
++        const shared = [_]?u8{ 2, 3, 2, 0, null, null, null, null, null, null, null }; // xg, xu, xd, z: the regions'
+         inline for (.{ "xg", "xu", "xd", "z", "no_y", "ids", "count", "counts", "members", "work_gu", "work_d" }, 0..) |f, j| {
+-            @field(xs, f) = try a.take(sz[j]);
++            if (shared[j]) |g| try rg.take(a, g, &@field(ch.xs, f), sz[j]) else @field(ch.xs, f) = try a.take(sz[j]);
+         }
+-        ch.xs = xs;
+         ch.xsd = try decodeScratch(e, a, ex, sl);
+         ch.gl = try a.take(16 * (d / 256) * c.experts * 4);
+         // prefill.Workspace: the largest prompt GEMM's rotated input and W_q (fp16) over every layer, and the Hadamard
+@@ -444,7 +514,10 @@ pub const Chunk = struct {
+                 if (l.plain != 0) max_plain_n = @max(max_plain_n, l.n);
+             }
+         }
+-        ch.ws = .{ .xh = try a.take(cap * max_xk * 2), .w = try a.take(max_kn * 2), .h = try a.take(128 * 128 * 2) };
++        ch.ws = .{ .xh = 0, .w = 0, .h = 0 };
++        try rg.take(a, 4, &ch.ws.xh, cap * max_xk * 2);
++        try rg.take(a, 0, &ch.ws.w, max_kn * 2);
++        ch.ws.h = try a.take(128 * 128 * 2);
+         ch.blas_ws = try a.take(cublas.Blas.workspace_bytes);
+         // a plain (mixed pack) linear's fp32 output: its bf16 result, then ops.toF32
+         ch.plain_tmp = try a.take(@max(cap * max_plain_n * 2, 1));
+@@ -478,10 +551,12 @@ pub const Chunk = struct {
+             max_gz = @max(max_gz, exl3_linear.zFloats(kv[0..ds.blocks.len], 128));
+             try addLinear(e, &ch, a, ds.main_proj, &max_gk, &max_gz);
+         }
+-        ch.taps = try a.take(@max(c.dspark_taps.slice().len, 1) * cap * d * 2);
++        try rg.take(a, 1, &ch.taps, @max(c.dspark_taps.slice().len, 1) * cap * d * 2);
+         ch.gxh = try a.take(128 * max_gk * 2);
+         ch.gz = try a.take(@max(max_gz, 1) * 4);
++        try rg.place(a);
+         // the scratch as experts.py makes it: zeros, the member lists -1
++        const xs = ch.xs;
+         for ([_]u64{ xs.xg, xs.xu, xs.xd, xs.z, xs.no_y, xs.ids, xs.count, xs.counts }, [_]usize{ sz[0], sz[1], sz[2], sz[3], sz[4], sz[5], sz[6], sz[7] }) |p, n| try fill(e, p, 0, n);
+         try fill32(e, xs.members, 0xffffffff, sz[8] / 4);
+         try fill(e, ch.neg, 0xff, cap * 8);
+@@ -946,6 +1021,17 @@ pub var replay_floor = false;
+ pub var idx_split = true;
+ pub var idx_split_min_comp: usize = 65536;
+ 
++/// TF_DS_PROMPT_ALIAS=1 (Chunk.init; unset or 0: as served): the prompt pass's large scratch in five shared regions,
++/// ~1.6 GiB less a rank at 2,048 rows and a 1M context, room for the pool. Every launch reads the bytes it reads as
++/// served, so no reply moves. A rank's own memory: the ranks need not agree. TP2 only (the four-node split: not ported).
++pub var alias = false;
++
++pub fn aliasEnv() void {
++    const v = std.c.getenv("TF_DS_PROMPT_ALIAS") orelse return;
++    alias = std.mem.eql(u8, std.mem.span(v), "1");
++    if (alias) std.log.info("the prompt pass's scratch in shared regions (TF_DS_PROMPT_ALIAS)", .{});
++}
++
+ /// attention_k: the partial pa [n, D] fp32 of this rank's heads; the chunk's keys go into the layer's window ring
+ /// (bf16 [window + RING_EXTRA, head_dim]). A compressed layer also attends to its kv source's latents the indexer picks
+ /// (a kv source first compresses the chunk into them). `floor`: no window key before this position.
+@@ -1009,7 +1095,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
+         const src = sh.kv_layer orelse return error.NoKvSource;
+         n_comp_end = (start + n) / r;
+         // vis = (pos + 1) // ratio: the compressed entries row i may see (host-made: the same integers)
+-        var vis_host: [4096]i64 = undefined;
++        var vis_host: [max_pass_rows]i64 = undefined;
+         if (n > vis_host.len) return error.ChunkTooLong;
+         for (0..n) |i| vis_host[i] = @intCast((start + i + 1) / r);
+         try upload(e, ch.vis, &vis_host, n * 8);
+@@ -1221,8 +1307,8 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared,
+     }
+     sh.kv_layer = li;
+     // groups first // r .. and their positions group * r (the rotations _rot reads)
+-    var g_host: [4096]i64 = undefined;
+-    var p_host: [4096]i64 = undefined;
++    var g_host: [max_pass_rows]i64 = undefined;
++    var p_host: [max_pass_rows]i64 = undefined;
+     if (full > g_host.len) return error.ChunkTooLong;
+     for (0..full) |j| {
+         g_host[j] = @intCast(start / r + j);
+@@ -1278,7 +1364,7 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
+         try tri_norm.rowmm2(e.t, ch.x, c.hidden, lay.idx_proj_h, ch.wl, n, c.hidden, ih);
+     } else {
+         try e.ops.toF32(e.s, ch.x, ch.xf, n * c.hidden);
+-        try e.blas.xwT(ch.xf, lay.idx_proj, ch.wl, n, c.hidden, ih);
++        try e.blas.xwTRows(ch.xf, lay.idx_proj, ch.wl, n, c.hidden, ih, pass_gemm_rows);
+     }
+     try e.exact.bf16Scale(e.s, ch.wl, ch.iw, n * ih, exact.indexScale(id, ih));
+     const kk = @min(c.index_topk, n_comp_end);
+@@ -1401,7 +1487,7 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
+     } else {
+         try e.ops.toF32(e.s, ch.x, ch.xf, n * d);
+         try e.ops.f16ToF32(e.s, lay.gate_w, ch.gate_f, c.experts * d);
+-        try e.blas.xwT(ch.xf, ch.gate_f, ch.logits, n, d, c.experts);
++        try e.blas.xwTRows(ch.xf, ch.gate_f, ch.logits, n, d, c.experts, pass_gemm_rows);
+         try tri_norm.route(e.t, ch.logits, 0, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);
+     }
+     try routeSpans(e, ch, lay, shared_id, sl, kc);
+@@ -1602,7 +1688,7 @@ pub fn engramRows(eh: *EngramHost, l: usize, t: engram_io.Table, seq: []const i3
+             eh.lead_ready[l] = false;
+             return eh.ahead_rows[l];
+         }
+-    } else if (l < 2 and eh.ahead_ready[l] and eh.ahead_start == start and eh.ahead_n == n) {
++    } else if (l < 2 and eh.ahead_ready[l] and eh.ahead_start == start and eh.ahead_n >= n) {
+         eh.ahead_ready[l] = false;
+         return eh.ahead_rows[l];
+     }
