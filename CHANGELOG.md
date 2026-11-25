@@ -15,7 +15,13 @@
   the 2,048 grid, so a cache gridded on the pass rows would pass over a state kept at 6,144 (or 2,048). Extents stay
   4,096-aligned, so at `CONTEXT=1048576` / `MAX_TOKENS=65536` two full-window requests need `POOL >= 2236416`.
   Measured on this pair at `POOL=2236416`, `PROMPT_ALIAS=1`: prefill 8K 2,040 -> 2,177 tok/s (+6.7%), 32K
-  2,075 -> 2,367 (+14.0%), 64K 1,884 -> 2,092 (+11.0%), 128K 1,842 -> 2,022 (+9.8%); TTFT down 6-12%.
+  2,075 -> 2,367 (+14.0%), 64K 1,884 -> 2,092 (+11.0%), 128K 1,842 -> 2,022 (+9.8%); TTFT down 6-12%. A cold
+  re-measure on a fresh server with a different prompt set: 8K 2,133, 32K 2,327, 64K 2,388, 128K 2,277 tok/s, every
+  request `cached 0`, 0 errors (that machine ran 12-14% faster than the A/B's after run, so the A/B is the honest
+  code-only figure). The cache's grid is what makes the hits work: a state kept at 6,144 or 2,048 is found in memory,
+  and the durable tier's longest point is asked for at all - on the 4,096 grid the tier's probe capped at 118,784, so
+  a 120,832-token point was never requested. The same prompts after a restart: 128K 1.39 s (120,832 cached) instead
+  of 66.57 s cold, 64K 1.25 s instead of 32.53 s.
 - `zig/patches/0060-long-session-cache.patch` (unsharded placement, with or without spill): a cached prefix no longer
   evicts itself when its continuation needs more than half the pool and a separate copy cannot fit. Under pressure it
   grows in place, invalidating only idle states in the overwritten tail; live streams and loading restores are
